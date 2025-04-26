@@ -14,7 +14,7 @@ load_dotenv()
 # Configuration
 CLIENT_ID      = os.getenv("BITRIX_CLIENT_ID")
 CLIENT_SECRET  = os.getenv("BITRIX_CLIENT_SECRET")
-REDIRECT_URI   = os.getenv("REDIRECT_URI")        # https://callback.mybitrixbot.ru/callback
+REDIRECT_URI   = os.getenv("REDIRECT_URI")        # https://callback.mybitrixbot.ru
 WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN")      # https://handler.mybitrixbot.ru
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -115,7 +115,7 @@ async def cmd_start(m: Message):
         f"?client_id={CLIENT_ID}"
         f"&response_type=code"
         f"&state={state}"
-        f"&redirect_uri={REDIRECT_URI}"
+        f"&redirect_uri={REDIRECT_URI}/callback"
     )
     await m.answer(
         f"Привет! Для подключения Bitrix24 перейди по ссылке:\n{auth_url}"

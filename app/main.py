@@ -1,161 +1,262 @@
-import os
-import threading
-import requests
+import asyncio
+import json
+from urllib.parse import parse_qs
+from time import time
+import httpx
+
 from typing import Dict
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from aiogram import Bot, Dispatcher, types
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
-from dotenv import load_dotenv
 
-load_dotenv()
+BITRIX_CLIENT_ID = "local.68122d64ea29a1.85490975"
+BITRIX_CLIENT_SECRET = "sFQq1zjJ2V4EAjAnP842GwOKKJT5Tb0WJ25btXtC3IR2VVg72d"
+REDIRECT_URI = "https://mybitrixbot.ru/callback"
+WEBHOOK_DOMAIN = "https://mybitrixbot.ru"
+TELEGRAM_TOKEN = "8179379861:AAEoKsITnDaREJINuHJu4qXONwxTIlSncxc"
 
-# Configuration
-CLIENT_ID      = os.getenv("BITRIX_CLIENT_ID")
-CLIENT_SECRET  = os.getenv("BITRIX_CLIENT_SECRET")
-REDIRECT_URI   = os.getenv("REDIRECT_URI")        # https://callback.mybitrixbot.ru
-WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN")      # https://handler.mybitrixbot.ru
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+tokens: Dict[str, Dict[str, str]] = {}
+member_map: Dict[str, str] = {}
 
-# In-memory storage
-tokens: Dict[str, Dict[str, str]] = {}       # chat_id -> { access_token, refresh_token, domain }
-member_map: Dict[str, str] = {}                # bitrix member_id -> chat_id
-
-# FastAPI and Bot setup
 app = FastAPI()
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# --- FastAPI endpoints ---
+async def refresh_token(chat_id: str) -> bool:
+    user_data = tokens.get(chat_id)
+    if not user_data:
+        return False
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                "https://oauth.bitrix.info/oauth/token/",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": BITRIX_CLIENT_ID,
+                    "client_secret": BITRIX_CLIENT_SECRET,
+                    "refresh_token": user_data["refresh_token"]
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            tokens[chat_id].update({
+                "access_token": data["access_token"],
+                "refresh_token": data["refresh_token"],
+                "expires": str(int(time()) + int(data["expires_in"]))
+            })
+            return True
+        except Exception as e:
+            print(f"Token refresh failed: {str(e)}")
+            return False
+
+
+def flatten_parsed_data(parsed_data: dict) -> dict:
+    return {k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in parsed_data.items()}
+
+
+# --- Обработчики маршрутов ---
 @app.get("/callback")
 async def oauth_callback(request: Request):
-    # Step 1: receive code, state, domain, member_id from Bitrix24
-    code      = request.query_params.get("code")
-    state     = request.query_params.get("state")      # telegram chat_id
-    domain    = request.query_params.get("domain")
-    member_id = request.query_params.get("member_id")
-    if not code or not state or not domain or not member_id:
-        raise HTTPException(400, "Missing code/state/domain/member_id")
+    params = request.query_params
+    if not all(key in params for key in ["code", "state", "domain", "member_id"]):
+        raise HTTPException(400, "Missing required parameters")
 
-    # Step 2: exchange code for tokens
-    resp = requests.post(
-        "https://oauth.bitrix24.com/oauth/token/",
-        data={
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "client_id":     CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri":  REDIRECT_URI
-        }
-    )
-    data = resp.json()
-    if "access_token" not in data:
-        raise HTTPException(400, data)
+    async with httpx.AsyncClient() as client:
+        try:
+            # Обмен кода на токены
+            token_resp = await client.post(
+                "https://oauth.bitrix.info/oauth/token/",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": params["code"],
+                    "client_id": BITRIX_CLIENT_ID,
+                    "client_secret": BITRIX_CLIENT_SECRET,
+                    "redirect_uri": REDIRECT_URI
+                }
+            )
+            token_resp.raise_for_status()
+            token_data = token_resp.json()
 
-    # Step 3: store tokens keyed by chat_id
-    tokens[state] = {
-        "access_token":  data["access_token"],
-        "refresh_token": data["refresh_token"],
-        "domain":        domain
-    }
-    # map bitrix member_id to telegram chat
-    member_map[member_id] = state
+            # Получение данных пользователя
+            user_resp = await client.get(
+                f"https://{params['domain']}/rest/user.current.json",
+                params={"auth": token_data["access_token"]}
+            )
+            user_resp.raise_for_status()
+            user_data = user_resp.json().get("result", {})
+            bitrix_user_id = user_data.get("ID")
 
-    # Step 4: bind ONTASKADD event automatically
-    bind_resp = requests.post(
-        f"https://{domain}/rest/event.bind",
-        data={
-            "event":   "ONTASKADD",
-            "handler": f"{WEBHOOK_DOMAIN}/handler",
-            "auth":    data["access_token"]
-        }
-    )
+            # Сохранение данных
+            tokens[params["state"]] = {
+                "access_token": token_data["access_token"],
+                "refresh_token": token_data["refresh_token"],
+                "domain": params["domain"],
+                "bitrix_user_id": str(bitrix_user_id),
+                "expires": str(int(time()) + int(token_data["expires_in"]))
+            }
+            member_map[params["member_id"]] = params["state"]
 
-    return JSONResponse({
-        "status": "ok",
-        "bound": bind_resp.json()
-    })
+            # Привязка вебхука
+            bind_resp = await client.post(
+                f"https://{params['domain']}/rest/event.bind.json",
+                json={
+                    "event": "ONTASKADD",
+                    "handler": f"{WEBHOOK_DOMAIN}/handler",
+                    "auth": token_data["access_token"]
+                }
+            )
+            bind_data = bind_resp.json()
 
-@app.post("/handler")
+            return JSONResponse({"status": "ok", "bound": bind_data})
+
+        except Exception as e:
+            raise HTTPException(500, f"OAuth error: {str(e)}")
+
+
+@app.api_route("/handler", methods=["GET", "POST", "HEAD"])
 async def bitrix_handler(request: Request):
-    # receive incoming webhook
-    body = await request.json()
-    event = body.get("event")
-    auth  = body.get("auth", {})
-    data  = body.get("data", [])
-    member_id = auth.get("member_id")
-    if not member_id or member_id not in member_map:
-        return JSONResponse({"status": "unknown_member"}, status_code=403)
+    if request.method in ["GET", "HEAD"]:
+        return JSONResponse({"status": "ok"})
 
-    chat_id = member_map[member_id]
-    user = tokens.get(chat_id)
-    if not user:
-        return JSONResponse({"status": "no_token"}, status_code=403)
+    try:
+        raw_body = await request.body()
+        parsed_data = parse_qs(raw_body.decode())
+        flat_data = flatten_parsed_data(parsed_data)
 
-    # handle task addition event
-    if event == "ONTASKADD" and data:
-        # parse task id from FIELDS_AFTER
-        record = data[0]
-        after  = record.get("FIELDS_AFTER", {})
-        task_id = after.get("ID")
-        if task_id:
+        # Логирование
+        print("Received Bitrix data:", flat_data)
+        await bot.send_message(
+            chat_id=858016468,
+            text=f"📩 Bitrix webhook:\n<pre>{json.dumps(flat_data, indent=2)}</pre>",
+            parse_mode=ParseMode.HTML
+        )
+
+        # Извлечение параметров
+        event = flat_data.get("event")
+        member_id = flat_data.get("auth[member_id]")
+        domain = flat_data.get("auth[domain]")
+        task_id = flat_data.get("data[FIELDS_AFTER][ID]")
+        expires = flat_data.get("auth[expires]", "0")
+
+        if not all([event, member_id, domain]):
+            return JSONResponse({"status": "error", "message": "Missing required fields"}, 400)
+
+        chat_id = member_map.get(member_id)
+        if not chat_id:
+            return JSONResponse({"status": "error", "message": "Member not registered"}, 404)
+
+        user_data = tokens.get(chat_id)
+        if not user_data:
+            return JSONResponse({"status": "error", "message": "User not authenticated"}, 401)
+
+        # Обновление токена при необходимости
+        if int(expires) < time():
+            if not await refresh_token(chat_id):
+                await bot.send_message(chat_id, "❌ Требуется повторная авторизация! /start")
+                return JSONResponse({"status": "error", "message": "Token expired"}, 401)
+
+        if event == "ONTASKADD" and task_id:
+            task_url = f"https://{domain}/company/personal/user/{user_data['bitrix_user_id']}/tasks/task/view/{task_id}/"
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"🆕 В Bitrix24 создана новая задача #{task_id}"
+                text=f"🆕 Новая задача в Bitrix24\n🔗 {task_url}\n📌 ID: #{task_id}"
             )
-    return {"status": "ok"}
 
-# --- Aiogram handlers ---
+        return JSONResponse({"status": "ok"})
+
+    except Exception as e:
+        print(f"Handler error: {str(e)}")
+        return JSONResponse({"status": "error", "message": str(e)}, 500)
+
+
+# --- Telegram Bot ---
+bot = Bot(
+    token=TELEGRAM_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+
+
+# --- Команды бота ---
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    state   = str(m.from_user.id)
+    state = str(m.from_user.id)
     auth_url = (
-        f"https://oauth.bitrix24.com/oauth/authorize/"
-        f"?client_id={CLIENT_ID}"
+        f"https://oauth.bitrix.info/oauth/authorize/"
+        f"?client_id={BITRIX_CLIENT_ID}"
         f"&response_type=code"
         f"&state={state}"
-        f"&redirect_uri={REDIRECT_URI}/callback"
+        f"&redirect_uri={REDIRECT_URI}"
     )
-    await m.answer(
-        f"Привет! Для подключения Bitrix24 перейди по ссылке:\n{auth_url}"
-    )
+    await m.answer(f"🔑 Для подключения Bitrix24 перейдите по ссылке:\n{auth_url}")
+
 
 @dp.message(Command("task"))
 async def cmd_task(m: Message):
     state = str(m.from_user.id)
-    user = tokens.get(state)
-    if not user:
-        await m.answer("❗ Сначала отправьте /start и завершите авторизацию.")
+    user_data = tokens.get(state)
+
+    if not user_data:
+        await m.answer("❗ Сначала выполните авторизацию через /start")
         return
-    # get title from message text
-    title = m.get_args() or "Задача из бота"
-    at     = user["access_token"]
-    domain = user["domain"]
 
-    # call tasks.task.add
-    resp = requests.post(
-        f"https://{domain}/rest/tasks.task.add",
-        json={
-            "fields": {"TITLE": title},
-            "auth": at
-        }
+    if int(time()) > int(user_data.get("expires", 0)):
+        if not await refresh_token(state):
+            await m.answer("❌ Требуется повторная авторизация! /start")
+            return
+
+    parts = (m.text or "").strip().split(maxsplit=1)
+    title = parts[1] if len(parts) > 1 else "Задача из бота"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                f"https://{user_data['domain']}/rest/tasks.task.add",
+                json={
+                    "fields": {
+                        "TITLE": title,
+                        "CREATED_BY": user_data["bitrix_user_id"],
+                        "RESPONSIBLE_ID": user_data["bitrix_user_id"]
+                    },
+                    "auth": user_data["access_token"]
+                }
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            if task_info := result.get("result", {}).get("task"):
+                await m.answer(f"✅ Задача создана!\nID: {task_info['id']}")
+            else:
+                await m.answer(f"❌ Ошибка: {result.get('error', 'Unknown error')}")
+
+        except Exception as e:
+            await m.answer(f"🚫 Ошибка при создании задачи: {str(e)}")
+
+
+# --- Запуск приложения ---
+async def main():
+    import uvicorn
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app=app,
+            host="0.0.0.0",
+            port=5000,
+            log_level="info"
+        )
     )
-    result = resp.json()
-    if "taskId" in result:
-        await m.answer(f"✅ Задача создана, её ID: {result['taskId']}")
-    else:
-        await m.answer(f"❌ Ошибка создания задачи: {result}")
 
-# --- Run both services ---
-def start_services():
-    # run FastAPI in a thread
-    threading.Thread(
-        target=lambda: __import__('uvicorn').run("main:app", host="0.0.0.0", port=8000),
-        daemon=True
-    ).start()
-    # run Telegram polling
-    dp.run_polling(bot)
+    await asyncio.gather(
+        server.serve(),
+        dp.start_polling(bot)
+    )
+
 
 if __name__ == "__main__":
-    start_services()
+    asyncio.run(main())

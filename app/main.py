@@ -17,16 +17,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 # Конфигурация
-BITRIX_CLIENT_ID = "local.68122d64ea29a1.85490975"
-BITRIX_CLIENT_SECRET = "sFQq1zjJ2V4EAjAnP842GwOKKJT5Tb0WJ25btXtC3IR2VVg72d"
+BITRIX_CLIENT_ID = "local.68187191a08683.25172914"
+BITRIX_CLIENT_SECRET = "46wPWoUU1YLv5d86ozDh7FbhODOi2L2mlmNBWweaA6jNxV2xX1"
 REDIRECT_URI = "https://mybitrixbot.ru/callback"
 WEBHOOK_DOMAIN = "https://mybitrixbot.ru"
 TELEGRAM_TOKEN = "8179379861:AAEoKsITnDaREJINuHJu4qXONwxTIlSncxc"
-BITRIX_DOMAIN = "b24-eu9n9c.bitrix24.ru"
+BITRIX_DOMAIN = "b24-rqyyhh.bitrix24.ru"
 
 # Хранилища данных
 tokens: Dict[str, Dict] = {}  # Хранение данных пользователя для протокола OAuth
-member_map: Dict[str, str] = {}
+member_map: Dict[str, str] = {}  # Связка пользователей (Формат: {member_id (Битрикс24): chat_id (Telegram)})
 notification_settings: Dict[str, Dict] = {}  # Настройки уведомлений пользователя
 
 # Настройка модуля логирования
@@ -41,6 +41,7 @@ dp = Dispatcher()
 # --- Вспомогательные функции ---
 async def refresh_token(chat_id: str) -> bool:
     """Обновление access token, используя refresh token"""
+
     # Получение данных пользователя
     user_data = tokens.get(chat_id)
     if not user_data:
@@ -78,16 +79,37 @@ async def get_user_info(domain: str, access_token: str) -> Dict:
     """Получение информации о пользователе, включая роли"""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"https://{domain}/rest/user.current.json",
+            f"https://{domain}/rest/profile.json",
             params={"auth": access_token}
         )
         data = resp.json()
+        data = data.get("result", {})
+
+        # logging.info(f"Data User Get: {data}") # Логи
 
         return {
-            "id": data.get("result", {}).get("ID"),
-            "is_admin": "ADMIN" in data.get("result", {}).get("ADMIN_LABELS", []),
-            "email": data.get("result", {}).get("EMAIL")
+            "id": data.get("ID"),
+            "is_admin": data.get("ADMIN"),
+            "name": f"{data.get("NAME")} {data.get("LAST_NAME")}".strip(),
         }
+
+
+async def get_user_name(domain: str, access_token: str, user_id: int) -> str:
+    """Получение имени пользователя по ID"""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://{domain}/rest/user.get.json",
+                params={
+                    "auth": access_token,
+                    "ID": user_id
+                }
+            )
+            user_data = resp.json().get('result', [{}])[0]
+            return f"{user_data.get('NAME', '')} {user_data.get('LAST_NAME', '')}".strip() or "Неизвестный"
+    except Exception as e:
+        logging.error(f"Error getting user name: {e}")
+        return "Неизвестный"
 
 
 async def check_user_exists(domain: str, access_token: str, user_id: int) -> bool:
@@ -103,7 +125,9 @@ async def check_user_exists(domain: str, access_token: str, user_id: int) -> boo
 
 async def register_webhooks(domain: str, access_token: str):
     """Регистрация обработчиков событий"""
-    events = [  # все события, которые нужно обрабатывать
+
+    # все события, которые нужно обрабатывать
+    events = [
         "OnTaskAdd", "OnTaskUpdate", "OnTaskDelete", "OnTaskCommentAdd",
         "OnCrmDealAdd", "OnCrmDealUpdate", "OnCrmDealDelete"
     ]
@@ -119,7 +143,7 @@ async def register_webhooks(domain: str, access_token: str):
                         "auth": access_token
                     }
                 )
-                # logging.info(f"Webhook {event} response: {resp.status_code} {resp.text}")
+                # logging.info(f"Webhook {event} response: {resp.status_code} {resp.text}") # Логи
             except Exception as e:
                 logging.error(f"Webhook registration error for {event}: {e}")
 
@@ -154,7 +178,7 @@ async def unified_handler(request: Request):
 async def handle_oauth_callback(request: Request):
     """Авторизация OAuth 2.0"""
     params = dict(request.query_params)
-    # logging.info(f"OAuth callback params: {params}")
+    # logging.info(f"OAuth callback params: {params}") # Логи
 
     try:
         required = ["code", "state", "domain"]
@@ -190,6 +214,8 @@ async def handle_oauth_callback(request: Request):
             member_map[member_id] = str(chat_id)
         user_info = await get_user_info(params['domain'], token_data['access_token'])
 
+        logging.info(f"User_info: {user_info}")  # Логи
+
         # Сохранение данных пользователя
         tokens[str(chat_id)] = {
             "access_token": token_data["access_token"],
@@ -198,6 +224,7 @@ async def handle_oauth_callback(request: Request):
             "domain": params["domain"],
             "member_id": params.get("member_id", ""),
             "user_id": user_info["id"],
+            "user_name": user_info["name"],
             "is_admin": user_info["is_admin"]
         }
 
@@ -226,7 +253,8 @@ async def handle_webhook_event(request: Request):
         # Получение данных
         form_data = await request.form()
         parsed_data = parse_form_data(dict(form_data))
-        # logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}")
+
+        # logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}") # Логи
 
         auth_data = parsed_data.get('auth', {})
         event = parsed_data.get('event', '').lower()
@@ -251,7 +279,9 @@ async def handle_webhook_event(request: Request):
             return JSONResponse({"status": "token_expired"}, status_code=401)
 
         # Срабатывание событий
-        if event.startswith("ontask"):  # задачи
+        if event.startswith("ontaskcomment"):  # комментарии к задачам
+            await process_comment_event(event, parsed_data, user_data, chat_id)
+        elif event.startswith("ontask"):  # задачи
             await process_task_event(event, parsed_data, user_data, chat_id)
         elif event.startswith("oncrmdeal"):  # сделки
             await process_deal_event(event, parsed_data, user_data, chat_id)
@@ -266,11 +296,192 @@ async def handle_webhook_event(request: Request):
 async def process_task_event(event: str, data: dict, user_data: dict, chat_id: str):
     """Получение уведомлений о задачах из Битрикса"""
     try:
-        task_id = data.get('data', {}).get('FIELDS_AFTER', {}).get('ID')
-        if not task_id:
-            logging.error("No task ID in webhook data")
-            return
+        task_id = None
+        logging.info(f"data: {data}")
+        if event != "ontaskdelete":
+            task_id = data.get('data', {}).get('FIELDS_AFTER', {}).get('ID')
+            if not task_id and event:
+                logging.error("No task ID in webhook data")
+                return
 
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"https://{user_data['domain']}/rest/tasks.task.get",
+                    params={
+                        "taskId": task_id,
+                        "auth": user_data["access_token"]
+                    }
+                )
+                resp.raise_for_status()
+                task_data = resp.json()
+
+                if 'error' in task_data:
+                    logging.error(f"Bitrix API error: {task_data['error_description']}")
+                    return
+
+                task = task_data.get('result', {}).get('task', {})
+
+                # logging.info(f"Task data: {task}") # Логи
+
+        message = ""
+        responsible_id = None
+
+        status_map = {
+            '1': "🆕 Новая",
+            '2': "🔄 В работе",
+            '3': "⏳ Ожидает контроля",
+            '4': "✅ Завершена",
+            '5': "⏸ Отложена",
+            '6': "❌ Отклонена"
+        }
+
+        title = task.get('title', 'Без названия')
+        description = task.get('description', 'Отсутствует')
+        priority = task.get('priority')
+        status_code = task.get('status')
+        status = status_map.get(status_code, f"Неизвестный статус ({status_code})")
+        responsible_id = task.get('responsibleId')
+        creator_name = task.get('creator').get('name')
+        responsible_name = task.get('responsible').get('name')
+        deadline = task.get('deadline')
+
+        if event == "ontaskadd":
+            message = (
+                f"Задача [ID: {task_id}] - 🆕Создана🆕\n"
+                f"📌Название: {title}\n"
+                f"📝Описание: {description}\n"
+                f"🚨Приоритет: {priority}\n"
+                f"📊Cтатус: {status}\n"
+                f"⏰Срок исполнения: {deadline}\n"
+                f"👤Постановщик: {creator_name}\n"
+                f"👤Исполнитель: {responsible_name}"
+            )
+        elif event == "ontaskupdate":
+            changed_by_id = task.get('changedBy')
+
+            changed_by_name = await get_user_name(
+                domain=user_data['domain'],
+                access_token=user_data["access_token"],
+                user_id=changed_by_id
+            )
+
+            message = (
+                f"Задача [ID: {task_id}] - 🔄Изменена🔄\n"
+                f"📌Название: {title}\n"
+                f"📝Описание: {description}\n"
+                f"🚨Приоритет: {priority}\n"
+                f"📊Cтатус: {status}\n"
+                f"⏰Срок исполнения: {deadline}\n"
+                f"👤Постановщик: {creator_name}\n"
+                f"👤Исполнитель: {responsible_name}\n"
+                f"👤Кто изменил: {changed_by_name}"
+            )
+        if responsible_id:
+            if str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin'):
+                await bot.send_message(chat_id, message)
+    except httpx.HTTPStatusError as e:
+        logging.error(f"API request failed: {e.response.text}")
+    except Exception as e:
+        logging.error(f"Task processing error: {e}")
+
+
+# Пока в процессе доработки
+async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: str):
+    """Получение уведомлений о сделках из Битрикса"""
+    try:
+        responsible_id = None
+        message = ""
+        deal = {}
+
+        # Обработка разных типов событий
+        if event != "oncrmdealdelete":
+            deal_id = data.get('data', {}).get('FIELDS', {}).get('ID')
+            if not deal_id:
+                return
+
+            name = ""
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"https://{user_data['domain']}/rest/crm.deal.get",
+                    params={
+                        "id": deal_id,
+                        "auth": user_data["access_token"]
+                    }
+                )
+                deal = resp.json().get("result", {})
+                responsible_id = deal.get('ASSIGNED_BY_ID')
+
+                if responsible_id:
+                    name = await get_user_name(
+                        domain=user_data['domain'],
+                        access_token=user_data["access_token"],
+                        user_id=responsible_id
+                    )
+
+            # logging.info(f"deal data: {deal}") # Логи
+
+            if event == "oncrmdealadd":
+                message = (
+                    f"🆕 Новая сделка\n"
+                    f"ID: {deal_id}\n"
+                    f"Название ЖК: {deal.get('TITLE')}\n"
+                    f"Адрес: {deal.get('COMMENTS', 'Не указано')}\n"
+                    f"Стадия: {deal.get('STAGE_ID')}\n"
+                    f"Ответственный: {name}"
+                )
+            elif event == "oncrmdealupdate":
+                message = (
+                    f"🔄 Изменена сделка\n"
+                    f"ID: {deal_id}\n"
+                    f"Название ЖК: {deal.get('TITLE')}\n"
+                    f"Адрес: {deal.get('COMMENTS', 'Не указано')}\n"
+                    f"Стадия: {deal.get('STAGE_ID')}\n"
+                    f"Ответственный: {name}"
+                )
+
+        if responsible_id:
+            if str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin'):
+                await bot.send_message(chat_id, message)
+
+    except Exception as e:
+        logging.error(f"Ошибка обработки сделки: {e}")
+
+
+async def process_comment_event(event: str, data: dict, user_data: dict, chat_id: str):
+    """Обработка комментариев к задачам из Битрикса"""
+    try:
+        comment_data = data.get('data', {}).get('FIELDS_AFTER')
+        # logging.info(f"Comment data: {comment_data}") # Логи
+
+        comment_id = comment_data.get('ID')
+        task_id = comment_data.get('TASK_ID')
+        message = ""
+        responsible_id = None
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://{user_data['domain']}/rest/task.commentitem.get",
+                params={
+                    "taskId": task_id,
+                    "itemId": comment_id,
+                    "auth": user_data["access_token"]
+                }
+            )
+            comment = resp.json().get('result', {})
+            logging.info(f"Comment data: {comment}")
+
+            author_name = comment.get('AUTHOR_NAME')
+            comment_text = comment.get('POST_MESSAGE', '')[:1000]  # Обрезаем длинные сообщения
+            comment_date = comment.get('POST_DATE', '')
+            message = (
+                f"💬 Новый комментарий к задаче [ID: {task_id}]\n"
+                f"Автор: {author_name}\n"
+                f"Текст: {comment_text}\n"
+                f"Дата: {comment_date}\n"
+            )
+
+        # Добавляем ответственного
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"https://{user_data['domain']}/rest/tasks.task.get",
@@ -279,71 +490,15 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
                     "auth": user_data["access_token"]
                 }
             )
-            resp.raise_for_status()
-            task_data = resp.json()
+            task = resp.json().get('result', {}).get('task', {})
+            responsible_id = task.get('responsibleId')
 
-            if 'error' in task_data:
-                logging.error(f"Bitrix API error: {task_data['error_description']}")
-                return
-
-            task = task_data.get('result', {}).get('task', {})
-            logging.info(f"Task data: {task}")
-
-            message = ""
-            if event == "ontaskadd":
-                message = (
-                    f"🆕 Новая задача: {task.get('title', 'Без названия')}\n"
-                    f"Описание: {task.get('description', 'Отсутствует')}\n"
-                    f"Приоритет: {task.get('priority')}\n"
-                    f"Дедлайн: {task.get('deadline')}\n"
-                    f"ID: {task_id}"
-                )
-            elif event == "ontaskupdate":
-                message = (
-                    f"🆕 Обновлена задача: {task.get('title', 'Без названия')}\n"
-                    f"Описание: {task.get('description', 'Отсутствует')}\n"
-                    f"Приоритет: {task.get('priority')}\n"
-                    f"Дедлайн: {task.get('deadline')}\n"
-                    f"ID: {task_id}"
-                )
-
-            if message != "":
+        if responsible_id:
+            if str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin'):
                 await bot.send_message(chat_id, message)
-    except httpx.HTTPStatusError as e:
-        logging.error(f"API request failed: {e.response.text}")
+
     except Exception as e:
-        logging.error(f"Task processing error: {e}")
-
-
-async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: str):
-    """Получение уведомлений о сделках из Битрикса"""
-    try:
-        deal_id = data.get('data', {}).get('FIELDS', {}).get('ID')
-        if not deal_id:
-            return
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"https://{user_data['domain']}/rest/crm.deal.get",
-                params={"id": deal_id, "auth": user_data["access_token"]}
-            )
-            deal = resp.json().get("result", {})
-            # logging.info(f"Deal data: {deal}")
-
-            message = ""
-            if event == "oncrmdealadd":
-                message = (
-                    f"🆕 Новая сделка: {deal.get('title', 'Без названия')}\n"
-                    f"Стадия: {deal.get('stage_name', 'Неизвестна')}")
-            elif event == "oncrmdealupdate":
-                message = (
-                    f"🔄 Обновлена сделка: {deal.get('title', 'Без названия')}\n"
-                    f"Новая стадия: {deal.get('stage_name', 'Неизвестна')}")
-
-            if message != "":
-                await bot.send_message(chat_id, message)
-    except Exception as e:
-        logging.error(f"Deal processing error: {e}")
+        logging.error(f"Ошибка обработки комментария: {e}")
 
 
 # --- Telegram Bot ---
@@ -357,7 +512,9 @@ async def cmd_start(m: Message):
         f"&state={m.from_user.id}"
         f"&redirect_uri={REDIRECT_URI}"
     )
-    await m.answer(f"🔑 [Авторизация]({auth_url})", parse_mode="Markdown")
+
+    message_to_user = (f"Добро пожаловать!\n🔑 Для начала работы BitrixAssistant пройдите авторизацию: {auth_url}")
+    await m.answer(message_to_user)
 
 
 @dp.message(Command("task"))
@@ -374,11 +531,11 @@ async def cmd_task(m: Message):
         title = parts[0]
         description = parts[1] if len(parts) > 1 else ""
         responsible_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else user_data["user_id"]
-        priority = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 2
+        priority = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
         deadline = parts[4] if len(parts) > 4 else None
 
-        if priority not in (1, 2, 3):
-            raise ValueError("Приоритет должен быть 1, 2 или 3")
+        if priority not in (0, 1, 2):
+            raise ValueError("Приоритет должен быть 0, 1 или 2")
 
         if not await check_user_exists(user_data["domain"], user_data["access_token"], responsible_id):
             raise ValueError("Пользователь не найден")
@@ -428,23 +585,287 @@ async def cmd_task(m: Message):
 
     except (IndexError, ValueError) as e:
         await m.answer(
-            f"❌ Ошибка: {str(e)}\nФормат: /task Название | Описание | [ID_исполнителя] | [Приоритет] | [Дедлайн]")
+            f"❌ Ошибка: {str(e)}\nФормат: /task Название | Описание | [ID_исполнителя] | [Приоритет] | [Срок исполнения]")
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}", exc_info=True)
         await m.answer(f"⚠️ Системная ошибка: {str(e)}")
 
 
+# В процессе доработки
+@dp.message(Command("deal"))
+async def cmd_deal(m: Message):
+    """Создание сделки: /deal Название ЖК | Адрес | Стадия_ID"""
+    user_data = tokens.get(str(m.from_user.id))
+    if not user_data or not user_data.get("is_admin"):
+        return await m.answer("❗ Требуются права администратора. Авторизуйтесь через /start")
+
+    try:
+        parts = m.text.split(maxsplit=1)[1].split('|')
+        parts = [p.strip() for p in parts]
+
+        if len(parts) < 3:
+            raise ValueError("Недостаточно параметров. Формат: /deal Название ЖК | Адрес | ID_стадии")
+
+        title, address, stage_id = parts[0], parts[1], parts[2]
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{user_data['domain']}/rest/crm.deal.add.json",
+                params={"auth": user_data["access_token"]},
+                json={
+                    "fields": {
+                        "TITLE": title,
+                        "COMMENTS": address,
+                        "STAGE_ID": stage_id,
+                        "ASSIGNED_BY_ID": user_data["user_id"]
+                    }
+                }
+            )
+            data = resp.json()
+
+            if data.get('error'):
+                error_msg = data.get('error_description', 'Неизвестная ошибка Bitrix')
+                raise ValueError(f"Bitrix API: {error_msg}")
+
+            deal_id = data.get('result')
+            await m.answer(f"✅ Сделка создана! ID: {deal_id}")
+
+    except (IndexError, ValueError) as e:
+        await m.answer(f"❌ Ошибка: {str(e)}\nФормат: /deal Название ЖК | Адрес | ID_стадии")
+    except Exception as e:
+        logging.error(f"Ошибка создания сделки: {str(e)}", exc_info=True)
+        await m.answer(f"⚠️ Ошибка: {str(e)}")
+
+
+@dp.message(Command("comment"))
+async def cmd_comment(m: Message):
+    """Добавить комментарий к задаче: /comment [ID задачи] | Комментарий"""
+    user_data = tokens.get(str(m.from_user.id))
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    try:
+        # Парсим аргументы
+        parts = m.text.split(maxsplit=1)[1].split('|', 1)
+        if len(parts) < 2:
+            raise ValueError("Неверный формат команды")
+
+        task_id = parts[0].strip()
+        comment_text = parts[1].strip()
+
+        # Проверяем доступ к задаче
+        async with httpx.AsyncClient() as client:
+            # Проверка существования задачи
+            task_resp = await client.get(
+                f"https://{user_data['domain']}/rest/tasks.task.get.json",
+                params={
+                    "taskId": task_id,
+                    "auth": user_data["access_token"]
+                }
+            )
+            task_data = task_resp.json()
+            if 'error' in task_data:
+                raise ValueError("Задача не найдена или нет доступа")
+
+            # Отправка комментария
+            comment_resp = await client.post(
+                f"https://{user_data['domain']}/rest/task.commentitem.add.json",
+                params={"auth": user_data["access_token"]},
+                json={
+                    "TASK_ID": task_id,
+                    "fields": {
+                        "AUTHOR_ID": user_data["user_id"],
+                        "POST_MESSAGE": comment_text
+                    }
+                }
+            )
+            comment_data = comment_resp.json()
+
+            if 'error' in comment_data:
+                error_msg = comment_data.get('error_description', 'Ошибка добавления комментария')
+                raise ValueError(error_msg)
+
+            await m.answer(f"💬 Комментарий добавлен к задаче {task_id}")
+
+    except (IndexError, ValueError) as e:
+        await m.answer(f"❌ Ошибка: {str(e)}\nФормат: /comment [ID задачи] | [Текст комментария]")
+    except Exception as e:
+        logging.error(f"Comment error: {str(e)}", exc_info=True)
+        await m.answer(f"⚠️ Ошибка: {str(e)}")
+
+
+@dp.message(Command("stages"))
+async def cmd_stages(m: Message):
+    """Получить список стадий сделок"""
+    user_data = tokens.get(str(m.from_user.id))
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь: /start")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://{user_data['domain']}/rest/crm.dealcategory.stage.list",
+                params={"auth": user_data["access_token"]}
+            )
+            stages = resp.json().get('result', [])
+
+            message = "Доступные стадии:\n"
+            for stage in stages:
+                message += f"{stage['NAME']} (ID: {stage['STATUS_ID']})\n"
+
+            await m.answer(message)
+
+    except Exception as e:
+        await m.answer(f"⚠️ Ошибка: {str(e)}")
+
+
+@dp.message(Command("employees"))
+async def cmd_employees(m: Message):
+    """Получить список сотрудников Bitrix24"""
+    user_data = tokens.get(str(m.from_user.id))
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://{user_data['domain']}/rest/user.get.json",
+                params={
+                    "auth": user_data["access_token"],
+                    "FILTER": {"USER_TYPE": "employee"},
+                    "SELECT": ["ID", "NAME", "LAST_NAME"]
+                }
+            )
+            data = resp.json()
+
+            if 'error' in data:
+                error_msg = data.get('error_description', 'Неизвестная ошибка')
+                return await m.answer(f"❌ Ошибка Bitrix: {error_msg}")
+
+            users = data.get('result', [])
+            if not users:
+                return await m.answer("🤷 На портале нет сотрудников")
+
+            # Формируем список
+            user_list = []
+            for user in users:
+                user_id = user.get('ID', 'N/A')
+                name = f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".strip()
+                user_list.append(f"👤 {name} (ID: {user_id})")
+
+            # Разбиваем на сообщения по 20 пользователей
+            chunk_size = 20
+            for i in range(0, len(user_list), chunk_size):
+                chunk = user_list[i:i + chunk_size]
+                await m.answer(
+                    "Список сотрудников:\n\n" + "\n".join(chunk),
+                    parse_mode="HTML"
+                )
+
+    except Exception as e:
+        logging.error(f"Employees error: {str(e)}", exc_info=True)
+        await m.answer(f"⚠️ Ошибка при получении списка: {str(e)}")
+
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(m: Message):
+    """Показать список задач пользователя"""
+    user_data = tokens.get(str(m.chat.id))
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    try:
+        user_id = user_data['user_id']
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{user_data['domain']}/rest/tasks.task.list.json",
+                params={"auth": user_data["access_token"]},
+                json={
+                    "order": {"CREATED_DATE": "DESC"},
+                    "select": ["ID", "TITLE", "RESPONSIBLE_ID", "CREATED_BY", "STATUS", "DEADLINE"]
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if 'error' in data:
+                error_msg = data.get('error_description', 'Неизвестная ошибка')
+                raise ValueError(f"Bitrix API: {error_msg}")
+
+            tasks = data.get('result', {}).get('tasks', [])
+            if not tasks:
+                await m.answer("📭 У вас нет задач.")
+                return
+
+            status_map = {
+                '1': "🆕 Новая",
+                '2': "🔄 В работе",
+                '3': "⏳ Ожидает контроля",
+                '4': "✅ Завершена",
+                '5': "⏸ Отложена",
+                '6': "❌ Отклонена"
+            }
+
+            message = ["📋 Список задач:"]
+            for task in tasks:
+                task_id = task.get('id')
+                title = task.get('title', 'Без названия')
+                status_code = task.get('status')
+                status = status_map.get(status_code, f"Неизвестный статус ({status_code})")
+                responsible_id = task.get('responsibleId')
+                creator_name = task.get('creator').get('name')
+                responsible_name = task.get('responsible').get('name')
+                deadline = task.get('deadline')
+
+                deadline_str = "Не указан"
+                if deadline:
+                    try:
+                        deadline_date = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
+                        deadline_str = deadline_date.strftime("%d.%m.%Y %H:%M")
+                    except Exception as e:
+                        deadline_str = deadline
+
+                task_info = (
+                    f"\n🆔 ID: {task_id}",
+                    f"📌 Название: {title}",
+                    f"📊 Статус: {status}",
+                    f"👤 Исполнитель: {responsible_name}",
+                    f"👤 Постановщик: {creator_name}",
+                    f"⏰ Срок: {deadline_str}",
+                    "―――――――――――――――――――――"
+                )
+                message.extend(task_info)
+            message.append(f"\nПоказано {len(tasks)} задач.")
+
+            await m.answer("\n".join(message))
+
+    except httpx.HTTPStatusError as e:
+        logging.error(f"HTTP error: {e.response.text}")
+        await m.answer("❌ Ошибка подключения к Bitrix24.")
+    except ValueError as e:
+        await m.answer(f"❌ {str(e)}")
+    except Exception as e:
+        logging.error(f"Ошибка в /tasks: {str(e)}", exc_info=True)
+        await m.answer("⚠️ Ошибка при получении задач.")
+
+
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
     """Справка о командах бота"""
-    help_text = """
+    help_text = ("""
 📚 Доступные команды:
 /start - Авторизация в Bitrix24
-/task - Создать задачу (Формат: Название | Описание | [ID_исполнителя] | [Приоритет] | [Дедлайн])
-/deal - Создать сделку (только для админов)
-/comment - Добавить комментарий к задаче
-/help - Эта справка
-"""
+/tasks - Вывести список задач
+/task - Создать задачу (Формат: Название | Описание | [ID_исполнителя] | [Приоритет] | [Срок исполнения])
+/comment - Добавить комментарий к задаче (Формат: [ID_задачи] | Комментарий)
+/deal - Создать сделку (Формат: Название ЖК | Адрес | [ID_стадии]) ❗Только для админов❗
+/employees - Получить список сотрудников
+/stages - Получить список доступных стадий для сделок
+
+/help - Справка о командах
+    """)
+
     await m.answer(help_text)
 
 

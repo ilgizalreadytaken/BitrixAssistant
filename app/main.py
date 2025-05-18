@@ -6,7 +6,6 @@ from time import time
 from typing import Dict, Optional
 import datetime
 
-
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -19,12 +18,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 # Конфигурация
-BITRIX_CLIENT_ID = "local.68187191a08683.25172914"
-BITRIX_CLIENT_SECRET = "46wPWoUU1YLv5d86ozDh7FbhODOi2L2mlmNBWweaA6jNxV2xX1"
+# BITRIX_CLIENT_ID = "local.68187191a08683.25172914"  # client_id Данила
+BITRIX_CLIENT_ID = "local.68122d64ea29a1.85490975"  # client_id Ильгиза
+
+# BITRIX_CLIENT_SECRET = "46wPWoUU1YLv5d86ozDh7FbhODOi2L2mlmNBWweaA6jNxV2xX1"  # client_secret Данила
+BITRIX_CLIENT_SECRET = "sFQq1zjJ2V4EAjAnP842GwOKKJT5Tb0WJ25btXtC3IR2VVg72d"  # client_secret Ильгиза
+
 REDIRECT_URI = "https://mybitrixbot.ru/callback"
 WEBHOOK_DOMAIN = "https://mybitrixbot.ru"
 TELEGRAM_TOKEN = "8179379861:AAEoKsITnDaREJINuHJu4qXONwxTIlSncxc"
-BITRIX_DOMAIN = "b24-rqyyhh.bitrix24.ru"
+
+# BITRIX_DOMAIN = "b24-rqyyhh.bitrix24.ru"  # Домен портала Битрикс24 Данила
+BITRIX_DOMAIN = "b24-eu9n9c.bitrix24.ru"  # Домен портала Битрикс24 Ильгиза
 
 # Хранилища данных
 tokens: Dict[str, Dict] = {}  # Хранение данных пользователя для протокола OAuth
@@ -145,7 +150,7 @@ async def register_webhooks(domain: str, access_token: str):
                         "auth": access_token
                     }
                 )
-                # logging.info(f"Webhook {event} response: {resp.status_code} {resp.text}") # Логи
+                logging.info(f"Webhook {event} response: {resp.status_code} {resp.text}")  # Логи
             except Exception as e:
                 logging.error(f"Webhook registration error for {event}: {e}")
 
@@ -180,7 +185,7 @@ async def unified_handler(request: Request):
 async def handle_oauth_callback(request: Request):
     """Авторизация OAuth 2.0"""
     params = dict(request.query_params)
-    # logging.info(f"OAuth callback params: {params}") # Логи
+    logging.info(f"OAuth callback params: {params}")  # Логи
 
     try:
         required = ["code", "state", "domain"]
@@ -323,33 +328,40 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
 
                 task = task_data.get('result', {}).get('task', {})
 
-                # logging.info(f"Task data: {task}") # Логи
+                logging.info(f"Task data: {task}")  # Логи
 
         message = ""
         responsible_id = None
 
         status_map = {
-            '1': "🆕 Новая",
-            '2': "🔄 В работе",
-            '3': "⏳ Ожидает контроля",
-            '4': "✅ Завершена",
-            '5': "⏸ Отложена",
-            '6': "❌ Отклонена"
+            '2': "🆕 Ждет выполнения",
+            '3': "🔄 Выполняется",
+            '4': "⏳ Ожидает контроля",
+            '5': "✅ Завершена",
+            '6': "⏸ Отложена"
+        }
+
+        priority_map = {
+            '0': "Низкий",
+            '1': "Средний",
+            '2': "Высокий"
         }
 
         title = task.get('title', 'Без названия')
         description = task.get('description', 'Отсутствует')
-        priority = task.get('priority')
+        priority_code = task.get('priority')
+        priority = priority_map.get(priority_code)
         status_code = task.get('status')
         status = status_map.get(status_code, f"Неизвестный статус ({status_code})")
         responsible_id = task.get('responsibleId')
         creator_name = task.get('creator').get('name')
         responsible_name = task.get('responsible').get('name')
         deadline = task.get('deadline')
+        user_id = user_data["user_id"]
 
         if event == "ontaskadd":
             message = (
-                f"Задача [ID: {task_id}] - 🆕Создана🆕\n"
+                f"Задача <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b> - 🆕Создана🆕\n"
                 f"📌Название: {title}\n"
                 f"📝Описание: {description}\n"
                 f"🚨Приоритет: {priority}\n"
@@ -368,7 +380,7 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
             )
 
             message = (
-                f"Задача [ID: {task_id}] - 🔄Изменена🔄\n"
+                f"Задача <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b> - 🔄Изменена🔄\n"
                 f"📌Название: {title}\n"
                 f"📝Описание: {description}\n"
                 f"🚨Приоритет: {priority}\n"
@@ -421,7 +433,7 @@ async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: s
                         user_id=responsible_id
                     )
 
-            # logging.info(f"deal data: {deal}") # Логи
+            logging.info(f"deal data: {deal}")  # Логи
 
             if event == "oncrmdealadd":
                 message = (
@@ -460,6 +472,7 @@ async def process_comment_event(event: str, data: dict, user_data: dict, chat_id
         task_id = comment_data.get('TASK_ID')
         message = ""
         responsible_id = None
+        user_id = user_data["user_id"]
 
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -471,13 +484,13 @@ async def process_comment_event(event: str, data: dict, user_data: dict, chat_id
                 }
             )
             comment = resp.json().get('result', {})
-            logging.info(f"Comment data: {comment}")
+            logging.info(f"Comment data: {comment}")  # Логи
 
             author_name = comment.get('AUTHOR_NAME')
             comment_text = comment.get('POST_MESSAGE', '')[:1000]  # Обрезаем длинные сообщения
             comment_date = comment.get('POST_DATE', '')
             message = (
-                f"💬 Новый комментарий к задаче [ID: {task_id}]\n"
+                f"💬 Новый комментарий к задаче <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b>\n"
                 f"Автор: {author_name}\n"
                 f"Текст: {comment_text}\n"
                 f"Дата: {comment_date}\n"
@@ -801,15 +814,14 @@ async def cmd_tasks(m: Message):
                 return
 
             status_map = {
-                '1': "🆕 Новая",
-                '2': "🔄 В работе",
-                '3': "⏳ Ожидает контроля",
-                '4': "✅ Завершена",
-                '5': "⏸ Отложена",
-                '6': "❌ Отклонена"
+                '2': "🆕 Ждет выполнения",
+                '3': "🔄 Выполняется",
+                '4': "⏳ Ожидает контроля",
+                '5': "✅ Завершена",
+                '6': "⏸ Отложена"
             }
 
-            message = ["📋 Список задач:"]
+            message = ["📋 Список задач:\n"]
             for task in tasks:
                 task_id = task.get('id')
                 title = task.get('title', 'Без названия')
@@ -829,12 +841,8 @@ async def cmd_tasks(m: Message):
                         deadline_str = deadline
 
                 task_info = (
-                    f"\n🆔 ID: {task_id}",
+                    f"Задача <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b>",
                     f"📌 Название: {title}",
-                    f"📊 Статус: {status}",
-                    f"👤 Исполнитель: {responsible_name}",
-                    f"👤 Постановщик: {creator_name}",
-                    f"⏰ Срок: {deadline_str}",
                     "―――――――――――――――――――――"
                 )
                 message.extend(task_info)

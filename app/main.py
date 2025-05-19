@@ -1,10 +1,12 @@
 import asyncio
 import json
 import logging
+import collections
 from urllib.parse import parse_qs
 from time import time
 from typing import Dict, Optional
-import datetime
+from collections import defaultdict
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -19,10 +21,10 @@ from aiogram.fsm.state import State, StatesGroup
 
 # Конфигурация
 # BITRIX_CLIENT_ID = "local.68187191a08683.25172914"  # client_id Данила
-BITRIX_CLIENT_ID = "local.68122d64ea29a1.85490975"  # client_id Ильгиза
+BITRIX_CLIENT_ID = "local.682b075811e9c7.97053039"  # client_id Ильгиза
 
 # BITRIX_CLIENT_SECRET = "46wPWoUU1YLv5d86ozDh7FbhODOi2L2mlmNBWweaA6jNxV2xX1"  # client_secret Данила
-BITRIX_CLIENT_SECRET = "sFQq1zjJ2V4EAjAnP842GwOKKJT5Tb0WJ25btXtC3IR2VVg72d"  # client_secret Ильгиза
+BITRIX_CLIENT_SECRET = "1G4LgG178KbNUuuTiFjMPVjQlh1kSLyLSsSieuTfbFk0CHQRCA"  # client_secret Ильгиза
 
 REDIRECT_URI = "https://mybitrixbot.ru/callback"
 WEBHOOK_DOMAIN = "https://mybitrixbot.ru"
@@ -31,9 +33,11 @@ TELEGRAM_TOKEN = "8179379861:AAEoKsITnDaREJINuHJu4qXONwxTIlSncxc"
 # BITRIX_DOMAIN = "b24-rqyyhh.bitrix24.ru"  # Домен портала Битрикс24 Данила
 BITRIX_DOMAIN = "b24-eu9n9c.bitrix24.ru"  # Домен портала Битрикс24 Ильгиза
 
+is_registered_events: Dict[str, bool] = {}
+
 # Хранилища данных
 tokens: Dict[str, Dict] = {}  # Хранение данных пользователя для протокола OAuth
-member_map: Dict[str, str] = {}  # Связка пользователей (Формат: {member_id (Битрикс24): chat_id (Telegram)})
+member_map: Dict[str, set[str]] = defaultdict(set)  # ключ — это member_id портала, а значение — set чат‑ID
 notification_settings: Dict[str, Dict] = {}  # Настройки уведомлений пользователя
 
 # Настройка модуля логирования
@@ -97,7 +101,7 @@ async def get_user_info(domain: str, access_token: str) -> Dict:
         return {
             "id": data.get("ID"),
             "is_admin": data.get("ADMIN"),
-            "name": f"{data.get("NAME")} {data.get("LAST_NAME")}".strip(),
+            "name": f"{data.get('NAME')} {data.get('LAST_NAME')}".strip(),
         }
 
 
@@ -131,9 +135,11 @@ async def check_user_exists(domain: str, access_token: str, user_id: int) -> boo
 
 
 async def register_webhooks(domain: str, access_token: str):
-    """Регистрация обработчиков событий"""
-
-    # все события, которые нужно обрабатывать
+    """
+    1) Для каждого события вызываем event.get, чтобы получить список handler’ов
+    2) Удаляем каждый из них через event.unbind (по event + handler)
+    3) Ждём, пока всё отвязалось, и вешаем ровно по одному через event.bind
+    """
     events = [
         "OnTaskAdd", "OnTaskUpdate", "OnTaskDelete", "OnTaskCommentAdd",
         "OnCrmDealAdd", "OnCrmDealUpdate", "OnCrmDealDelete"
@@ -141,8 +147,38 @@ async def register_webhooks(domain: str, access_token: str):
 
     async with httpx.AsyncClient() as client:
         for event in events:
+            # 1) Получаем все текущие handler’ы для event
+            resp_get = await client.post(
+                f"https://{domain}/rest/event.get",
+                data={
+                    "event": event,
+                    "auth": access_token
+                }
+            )
+            resp_get.raise_for_status()
+            handlers = resp_get.json().get("result", [])
+
+            # 2) Удаляем каждый handler
+            for h in handlers:
+                handler_url = h.get("handler")
+                try:
+                    resp_un = await client.post(
+                        f"https://{domain}/rest/event.unbind",
+                        data={
+                            "event": event,
+                            "handler": handler_url,
+                            "auth": access_token
+                        }
+                    )
+                    resp_un.raise_for_status()
+                    logging.info(f"Unbound {event} → {handler_url}")
+                except Exception as e:
+                    logging.warning(f"Failed to unbind {event} → {handler_url}: {e}")
+
+        # 3) Привязываем заново по одному
+        for event in events:
             try:
-                resp = await client.post(
+                resp_bind = await client.post(
                     f"https://{domain}/rest/event.bind",
                     data={
                         "event": event,
@@ -150,9 +186,10 @@ async def register_webhooks(domain: str, access_token: str):
                         "auth": access_token
                     }
                 )
-                logging.info(f"Webhook {event} response: {resp.status_code} {resp.text}")  # Логи
+                resp_bind.raise_for_status()
+                logging.info(f"Bound {event} → {WEBHOOK_DOMAIN}/callback")
             except Exception as e:
-                logging.error(f"Webhook registration error for {event}: {e}")
+                logging.error(f"Failed to bind {event}: {e}")
 
 
 def parse_form_data(form_data: dict) -> dict:
@@ -186,6 +223,9 @@ async def handle_oauth_callback(request: Request):
     """Авторизация OAuth 2.0"""
     params = dict(request.query_params)
     logging.info(f"OAuth callback params: {params}")  # Логи
+    domain = params['domain']
+
+    global is_registered_events  # объявляем, что хотим править глобал
 
     try:
         required = ["code", "state", "domain"]
@@ -207,18 +247,17 @@ async def handle_oauth_callback(request: Request):
             )
             token_data = resp.json()
 
-        # Псоле авторизации регистрируем обработчики
-        try:
-            await register_webhooks(
-                domain=params['domain'],
-                access_token=token_data['access_token']
-            )
-        except Exception as e:
-            logging.error(f"Webhook registration failed: {str(e)}")
+        # регистрируем вебхуки только если для этого домена ещё не делали
+        if not is_registered_events.get(domain, False):
+            try:
+                await register_webhooks(domain=domain, access_token=token_data['access_token'])
+                is_registered_events[domain] = True
+            except Exception as e:
+                logging.error(f"Webhook registration failed for {domain}: {e}")
 
         member_id = params.get("member_id")
         if member_id:
-            member_map[member_id] = str(chat_id)
+            member_map[member_id].add(str(chat_id))
         user_info = await get_user_info(params['domain'], token_data['access_token'])
 
         logging.info(f"User_info: {user_info}")  # Логи
@@ -261,6 +300,8 @@ async def handle_webhook_event(request: Request):
         form_data = await request.form()
         parsed_data = parse_form_data(dict(form_data))
 
+        logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}")  # Логи
+
         # logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}") # Логи
 
         auth_data = parsed_data.get('auth', {})
@@ -271,27 +312,29 @@ async def handle_webhook_event(request: Request):
         if not member_id:
             return JSONResponse({"status": "invalid_member_id"}, status_code=400)
 
-        chat_id = member_map.get(member_id)
-        if not chat_id:
+        chat_ids = member_map.get(member_id, set())
+        if not chat_ids:
             logging.error(f"Member ID {member_id} not mapped to any chat")
             return JSONResponse({"status": "member_not_found"}, status_code=404)
 
-        user_data = tokens.get(chat_id)
-        if not user_data:
-            logging.error(f"User data not found for chat {chat_id}")
-            return JSONResponse({"status": "unauthorized"}, status_code=401)
+        for chat_id in chat_ids:
+            user_data = tokens.get(chat_id)
+            logging.info(f"Sending to chat {chat_id} with token expires at {user_data['expires']}")
+            if not user_data:
+                logging.error(f"User data not found for chat {chat_id}")
+                return JSONResponse({"status": "unauthorized"}, status_code=401)
 
-        # Обновление токена, если нужно
-        if time() > user_data["expires"] and not await refresh_token(chat_id):
-            return JSONResponse({"status": "token_expired"}, status_code=401)
+            # Обновление токена, если нужно
+            if time() > user_data["expires"] and not await refresh_token(chat_id):
+                return JSONResponse({"status": "token_expired"}, status_code=401)
 
-        # Срабатывание событий
-        if event.startswith("ontaskcomment"):  # комментарии к задачам
-            await process_comment_event(event, parsed_data, user_data, chat_id)
-        elif event.startswith("ontask"):  # задачи
-            await process_task_event(event, parsed_data, user_data, chat_id)
-        elif event.startswith("oncrmdeal"):  # сделки
-            await process_deal_event(event, parsed_data, user_data, chat_id)
+            # Срабатывание событий
+            if event.startswith("ontaskcomment"):  # комментарии к задачам
+                await process_comment_event(event, parsed_data, user_data, chat_id)
+            elif event.startswith("ontask"):  # задачи
+                await process_task_event(event, parsed_data, user_data, chat_id)
+            elif event.startswith("oncrmdeal"):  # сделки
+                await process_deal_event(event, parsed_data, user_data, chat_id)
 
         return JSONResponse({"status": "ok"})
 
@@ -359,6 +402,13 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
         deadline = task.get('deadline')
         user_id = user_data["user_id"]
 
+        if deadline:
+            try:
+                deadline_date = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
+                deadline_str = deadline_date.strftime("%d.%m.%Y %H:%M")
+            except Exception as e:
+                deadline_str = deadline
+
         if event == "ontaskadd":
             message = (
                 f"Задача <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b> - 🆕Создана🆕\n"
@@ -366,7 +416,7 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
                 f"📝Описание: {description}\n"
                 f"🚨Приоритет: {priority}\n"
                 f"📊Cтатус: {status}\n"
-                f"⏰Срок исполнения: {deadline}\n"
+                f"⏰Срок исполнения: {deadline_str}\n"
                 f"👤Постановщик: {creator_name}\n"
                 f"👤Исполнитель: {responsible_name}"
             )
@@ -385,14 +435,15 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
                 f"📝Описание: {description}\n"
                 f"🚨Приоритет: {priority}\n"
                 f"📊Cтатус: {status}\n"
-                f"⏰Срок исполнения: {deadline}\n"
+                f"⏰Срок исполнения: {deadline_str}\n"
                 f"👤Постановщик: {creator_name}\n"
                 f"👤Исполнитель: {responsible_name}\n"
                 f"👤Кто изменил: {changed_by_name}"
             )
         if responsible_id:
-            if str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin'):
-                await bot.send_message(chat_id, message)
+            if not (str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin')):
+                return
+        await bot.send_message(chat_id, message)
     except httpx.HTTPStatusError as e:
         logging.error(f"API request failed: {e.response.text}")
     except Exception as e:
@@ -825,20 +876,6 @@ async def cmd_tasks(m: Message):
             for task in tasks:
                 task_id = task.get('id')
                 title = task.get('title', 'Без названия')
-                status_code = task.get('status')
-                status = status_map.get(status_code, f"Неизвестный статус ({status_code})")
-                responsible_id = task.get('responsibleId')
-                creator_name = task.get('creator').get('name')
-                responsible_name = task.get('responsible').get('name')
-                deadline = task.get('deadline')
-
-                deadline_str = "Не указан"
-                if deadline:
-                    try:
-                        deadline_date = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-                        deadline_str = deadline_date.strftime("%d.%m.%Y %H:%M")
-                    except Exception as e:
-                        deadline_str = deadline
 
                 task_info = (
                     f"Задача <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b>",

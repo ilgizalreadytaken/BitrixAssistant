@@ -18,6 +18,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # Конфигурация
 # BITRIX_CLIENT_ID = "local.68187191a08683.25172914"  # client_id Данила
@@ -38,7 +39,13 @@ is_registered_events: Dict[str, bool] = {}
 # Хранилища данных
 tokens: Dict[str, Dict] = {}  # Хранение данных пользователя для протокола OAuth
 member_map: Dict[str, set[str]] = defaultdict(set)  # ключ — это member_id портала, а значение — set чат‑ID
-notification_settings: Dict[str, Dict] = {}  # Настройки уведомлений пользователя
+notification_settings: Dict[str, Dict] = defaultdict(lambda: {
+    'new_deals': True,
+    'deal_updates': True,
+    'task_creations': True,
+    'task_updates': True,
+    'comments': True
+})
 
 # Настройка модуля логирования
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +55,8 @@ app = FastAPI()
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+class NotificationSettings(StatesGroup):
+    waiting_action = State()
 
 # --- Вспомогательные функции ---
 async def refresh_token(chat_id: str) -> bool:
@@ -274,6 +283,14 @@ async def handle_oauth_callback(request: Request):
             "is_admin": user_info["is_admin"]
         }
 
+        notification_settings[str(chat_id)] = {
+            'new_deals': True,
+            'deal_updates': True,
+            'task_creations': True,
+            'task_updates': True,
+            'comments': True
+        }
+
         await bot.send_message(chat_id, "✅ Авторизация успешна!")
         return HTMLResponse("""
             <html><head><meta charset='utf-8'><title>Авторизация</title>
@@ -327,6 +344,18 @@ async def handle_webhook_event(request: Request):
             # Обновление токена, если нужно
             if time() > user_data["expires"] and not await refresh_token(chat_id):
                 return JSONResponse({"status": "token_expired"}, status_code=401)
+
+            # В цикле обработки chat_ids добавьте:
+            if event == "oncrmdealadd" and not notification_settings[chat_id]['new_deals']:
+                continue
+            elif event == "oncrmdealupdate" and not notification_settings[chat_id]['deal_updates']:
+                continue
+            elif event == "ontaskadd" and not notification_settings[chat_id]['task_creations']:
+                continue
+            elif event == "ontaskupdate" and not notification_settings[chat_id]['task_updates']:
+                continue
+            elif event.startswith("ontaskcomment") and not notification_settings[chat_id]['comments']:
+                continue
 
             # Срабатывание событий
             if event.startswith("ontaskcomment"):  # комментарии к задачам
@@ -404,8 +433,8 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
 
         if deadline:
             try:
-                deadline_date = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-                deadline_str = deadline_date.strftime("%d.%m.%Y %H:%M")
+                deadline_date = datetime.strptime(deadline, "%Y-%m-%dT%H:%M:%S%z")  # Добавляем обработку часового пояса
+                deadline_str = deadline_date.strftime("%Y-%m-%d %H:%M")  # Новый формат
             except Exception as e:
                 deadline_str = deadline
 
@@ -457,18 +486,17 @@ async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: s
         responsible_id = None
         message = ""
         deal = {}
+        domain = user_data['domain']
+        user_id = user_data["user_id"]
 
-        # Обработка разных типов событий
         if event != "oncrmdealdelete":
             deal_id = data.get('data', {}).get('FIELDS', {}).get('ID')
             if not deal_id:
                 return
 
-            name = ""
-
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
-                    f"https://{user_data['domain']}/rest/crm.deal.get",
+                    f"https://{domain}/rest/crm.deal.get",
                     params={
                         "id": deal_id,
                         "auth": user_data["access_token"]
@@ -477,41 +505,52 @@ async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: s
                 deal = resp.json().get("result", {})
                 responsible_id = deal.get('ASSIGNED_BY_ID')
 
-                if responsible_id:
-                    name = await get_user_name(
-                        domain=user_data['domain'],
-                        access_token=user_data["access_token"],
-                        user_id=responsible_id
-                    )
+            # Получение имен
+            responsible_name = await get_user_name(
+                domain=domain,
+                access_token=user_data["access_token"],
+                user_id=responsible_id
+            ) if responsible_id else "Не указан"
 
-            logging.info(f"deal data: {deal}")  # Логи
+            changed_by_id = deal.get('MODIFY_BY_ID') or deal.get('MODIFIED_BY_ID')
+            changed_by_name = await get_user_name(
+                domain=domain,
+                access_token=user_data["access_token"],
+                user_id=changed_by_id
+            ) if changed_by_id else "Неизвестно"
+
+            # Формирование сообщения
+            deal_url = f"https://{domain}/crm/deal/details/{deal_id}/"
+            title = deal.get('TITLE', 'Без названия')
+            address = deal.get('COMMENTS', 'Не указано')
+            stage = deal.get('STAGE_ID', 'Неизвестно')
 
             if event == "oncrmdealadd":
                 message = (
-                    f"🆕 Новая сделка\n"
-                    f"ID: {deal_id}\n"
-                    f"Название ЖК: {deal.get('TITLE')}\n"
-                    f"Адрес: {deal.get('COMMENTS', 'Не указано')}\n"
-                    f"Стадия: {deal.get('STAGE_ID')}\n"
-                    f"Ответственный: {name}"
+                    f"Сделка <b><a href='{deal_url}'>№{deal_id}</a></b> - 🆕Создана🆕\n"
+                    f"🏢 Название: {title}\n"
+                    f"📍 Адрес: {address}\n"
+                    f"📈 Стадия: {stage}\n"
+                    f"👤 Ответственный: {responsible_name}"
                 )
             elif event == "oncrmdealupdate":
                 message = (
-                    f"🔄 Изменена сделка\n"
-                    f"ID: {deal_id}\n"
-                    f"Название ЖК: {deal.get('TITLE')}\n"
-                    f"Адрес: {deal.get('COMMENTS', 'Не указано')}\n"
-                    f"Стадия: {deal.get('STAGE_ID')}\n"
-                    f"Ответственный: {name}"
+                    f"Сделка <b><a href='{deal_url}'>№{deal_id}</a></b> - 🔄Изменена🔄\n"
+                    f"🏢 Название: {title}\n"
+                    f"📍 Адрес: {address}\n"
+                    f"📈 Стадия: {stage}\n"
+                    f"👤 Ответственный: {responsible_name}\n"
+                    f"✍️ Изменено: {changed_by_name}"
                 )
+
+            logging.info(f"Deal data: {deal}")
 
         if responsible_id:
             if str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin'):
-                await bot.send_message(chat_id, message)
+                await bot.send_message(chat_id, message, parse_mode='HTML')
 
     except Exception as e:
         logging.error(f"Ошибка обработки сделки: {e}")
-
 
 async def process_comment_event(event: str, data: dict, user_data: dict, chat_id: str):
     """Обработка комментариев к задачам из Битрикса"""
@@ -539,7 +578,7 @@ async def process_comment_event(event: str, data: dict, user_data: dict, chat_id
 
             author_name = comment.get('AUTHOR_NAME')
             comment_text = comment.get('POST_MESSAGE', '')[:1000]  # Обрезаем длинные сообщения
-            comment_date = comment.get('POST_DATE', '')
+            comment_date = datetime.strptime(comment['POST_DATE'], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d %H:%M")
             message = (
                 f"💬 Новый комментарий к задаче <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b>\n"
                 f"Автор: {author_name}\n"
@@ -897,6 +936,136 @@ async def cmd_tasks(m: Message):
         await m.answer("⚠️ Ошибка при получении задач.")
 
 
+@dp.message(Command("deals"))
+async def cmd_deals(m: Message):
+    """Показать список сделок"""
+    user_data = tokens.get(str(m.chat.id))
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    try:
+        domain = user_data['domain']
+        user_id = user_data["user_id"]
+        is_admin = user_data.get("is_admin", False)
+
+        # Формируем фильтр в зависимости от прав
+        filter_params = {} if is_admin else {"ASSIGNED_BY_ID": user_id}
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{domain}/rest/crm.deal.list",
+                params={"auth": user_data["access_token"]},
+                json={
+                    "order": {"DATE_CREATE": "DESC"},
+                    "filter": filter_params,
+                    "select": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID"]
+                }
+            )
+            data = resp.json()
+
+            if 'error' in data:
+                error_msg = data.get('error_description', 'Неизвестная ошибка')
+                raise ValueError(f"Bitrix API: {error_msg}")
+
+            deals = data.get('result', [])
+            if not deals:
+                await m.answer("📭 У вас нет сделок.")
+                return
+
+            # Маппинг стадий сделок (дополните при необходимости)
+            stage_map = {
+                'NEW': '🆕 Новая',
+                'PREPARATION': '📝 В работе',
+                'CLOSED': '✅ Закрыта',
+            }
+
+            message = ["🏢 Список сделок:\n"]
+            for deal in deals:
+                deal_id = deal.get('ID')
+                title = deal.get('TITLE', 'Без названия')
+                stage = stage_map.get(deal.get('STAGE_ID'), deal.get('STAGE_ID'))
+
+                deal_url = f"https://{domain}/crm/deal/details/{deal_id}/"
+                message.append(
+                    f"\n🔗 <b><a href='{deal_url}'>Сделка №{deal_id}</a></b>\n"
+                    f"🏷 Название: {title}\n"
+                    f"📌 Стадия: {stage}\n"
+                    "―――――――――――――――――――――"
+                )
+
+            message.append(f"\nПоказано {len(deals)} сделок.")
+            await m.answer("\n".join(message), parse_mode="HTML")
+
+    except Exception as e:
+        logging.error(f"Ошибка в /deals: {str(e)}", exc_info=True)
+        await m.answer(f"⚠️ Ошибка: {str(e)}")
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(m: Message):
+    """Меню настроек уведомлений"""
+    user_data = tokens.get(str(m.from_user.id))
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    await show_settings_menu(m.chat.id)
+
+
+async def show_settings_menu(chat_id: int):
+    settings = notification_settings[str(chat_id)]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"Новые сделки {'🔴' if not settings['new_deals'] else '🟢'}",
+                callback_data="toggle_new_deals"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"Изменения сделок {'🔴' if not settings['deal_updates'] else '🟢'}",
+                callback_data="toggle_deal_updates"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"Создание задач {'🔴' if not settings['task_creations'] else '🟢'}",
+                callback_data="toggle_task_creations"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"Изменения задач {'🔴' if not settings['task_updates'] else '🟢'}",
+                callback_data="toggle_task_updates"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"Комментарии {'🔴' if not settings['comments'] else '🟢'}",
+                callback_data="toggle_comments"
+            )
+        ]
+    ])
+
+    await bot.send_message(
+        chat_id,
+        "⚙️ Настройки уведомлений:\nВыберите тип уведомлений для настройки:",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith('toggle_'))
+async def process_toggle(callback: CallbackQuery):
+    chat_id = str(callback.message.chat.id)
+    action = callback.data.split('_', 1)[1]
+
+    # Инвертируем текущее значение
+    notification_settings[chat_id][action] = not notification_settings[chat_id][action]
+
+    # Обновляем сообщение
+    await callback.message.delete()
+    await show_settings_menu(callback.message.chat.id)
+    await callback.answer()
+
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
     """Справка о командах бота"""
@@ -907,8 +1076,10 @@ async def cmd_help(m: Message):
 /task - Создать задачу (Формат: Название | Описание | [ID_исполнителя] | [Приоритет] | [Срок исполнения])
 /comment - Добавить комментарий к задаче (Формат: [ID_задачи] | Комментарий)
 /deal - Создать сделку (Формат: Название ЖК | Адрес | [ID_стадии]) ❗Только для админов❗
+/deals - Показать список сделок
 /employees - Получить список сотрудников
 /stages - Получить список доступных стадий для сделок
+/settings - Настройка уведомлений
 
 /help - Справка о командах
     """)

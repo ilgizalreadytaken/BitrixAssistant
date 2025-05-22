@@ -1,31 +1,26 @@
 import asyncio
 import json
 import logging
-import collections
-from urllib.parse import parse_qs
 from time import time
 from typing import Dict, Optional
 from collections import defaultdict
 from datetime import datetime
-
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-
 import asyncpg
 from asyncpg import create_pool
 
+
 DATABASE_URL = "postgresql://botuser:123456789@localhost/bitrixbot"
 
-# Конфигурация
 # BITRIX_CLIENT_ID = "local.68187191a08683.25172914"  # client_id Данила
 BITRIX_CLIENT_ID = "local.682b075811e9c7.97053039"  # client_id Ильгиза
 
@@ -41,9 +36,9 @@ BITRIX_DOMAIN = "b24-eu9n9c.bitrix24.ru"  # Домен портала Битри
 
 is_registered_events: Dict[str, bool] = {}
 
-# Замените секцию "Хранилища данных" на:
 
 async def get_user(chat_id: int) -> Optional[dict]:
+    """Получает пользователя из базы данных по chat_id."""
     if not pool:
         raise RuntimeError("Database pool is not initialized")
     async with pool.acquire() as conn:
@@ -52,6 +47,7 @@ async def get_user(chat_id: int) -> Optional[dict]:
 
 
 async def save_user(user_data: dict):
+    """Сохраняет или обновляет данные пользователя в таблице users."""
     if not pool:
         raise RuntimeError("Database pool is not initialized")
 
@@ -82,6 +78,8 @@ async def save_user(user_data: dict):
 
 
 async def get_notification_settings(chat_id: int) -> dict:
+    """Получает настройки уведомлений для пользователя.
+    Если не существует — создаёт запись с настройками по умолчанию."""
     if not pool:
         raise RuntimeError("Database pool is not initialized")
 
@@ -109,6 +107,13 @@ async def get_notification_settings(chat_id: int) -> dict:
 
 
 async def update_notification_setting(chat_id: int, setting: str, value: bool):
+    """
+        Обновляет конкретную настройку уведомлений пользователя.
+
+        :param chat_id: Telegram chat ID пользователя
+        :param setting: Название поля настройки
+        :param value: Новое значение (True/False)
+        """
     if not pool:
         raise RuntimeError("Database pool is not initialized")
 
@@ -121,26 +126,35 @@ async def update_notification_setting(chat_id: int, setting: str, value: bool):
 
 
 async def delete_user(chat_id: int):
+    """
+        Удаляет пользователя из базы данных по chat_id.
+        Для рефреш токен.
+        :param chat_id: Telegram chat ID пользователя
+        """
     if not pool:
         raise RuntimeError("Database pool is not initialized")
 
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE chat_id = $1", chat_id)
 
+
 # Хранилища данных
 member_map: Dict[str, set[str]] = defaultdict(set)  # ключ — это member_id портала, а значение — set чат‑ID
 
-
-# Настройка модуля логирования
+# Базовая конфигурация логирования для всего приложения
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация
+# Инициализация компонентов FastAPI и Telegram-бота на Aiogram
 app = FastAPI()
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+
 class NotificationSettings(StatesGroup):
-    waiting_action = State()
+    """Состояния для настройки уведомлений."""
+
+    waiting_action = State()  # Ожидание выбора действия от пользователя
+
 
 # --- Вспомогательные функции ---
 async def refresh_token(chat_id: str) -> bool:
@@ -1144,9 +1158,10 @@ async def cmd_settings(m: Message):
 
 
 async def show_settings_menu(chat_id: int):
-    # Получаем настройки из БД
+    # Получаем текущие настройки уведомлений из базы данных
     settings = await get_notification_settings(chat_id)
 
+    # Создаём inline-клавиатуру с кнопками для включения/отключения уведомлений
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -1180,6 +1195,7 @@ async def show_settings_menu(chat_id: int):
         ]
     ])
 
+    # Отправляем сообщение с меню настроек и кнопками
     await bot.send_message(
         chat_id,
         "⚙️ Настройки уведомлений:\nВыберите тип уведомлений для настройки:",
@@ -1189,32 +1205,44 @@ async def show_settings_menu(chat_id: int):
 
 @dp.callback_query(lambda c: c.data.startswith('toggle_'))
 async def process_toggle(callback: CallbackQuery):
+    """
+        Обрабатывает нажатие на кнопку изменения настроек уведомлений.
+
+        Инвертирует соответствующее значение (вкл/выкл) в таблице notification_settings
+        и обновляет меню настроек.
+
+        :param callback: Объект нажатой callback-кнопки от пользователя
+        """
+
     if not pool:
         logging.error("Database pool is not initialized")
         return
 
+    # Извлекаем тип настройки из callback-данных, например: 'new_deals'
     action = callback.data.split('_', 1)[1]
     chat_id = callback.message.chat.id
 
     async with pool.acquire() as conn:
-        # Получаем текущее значение
+        # Получаем текущее значение этой настройки из базы данных
         current_value = await conn.fetchval(
             f"SELECT {action} FROM notification_settings WHERE chat_id = $1",
             chat_id
         )
 
-        # Инвертируем значение
+        # Инвертируем (меняем True на False и наоборот)
         new_value = not current_value
 
-        # Обновляем в БД
+        # Сохраняем обновлённое значение в базу
         await conn.execute(
             f"UPDATE notification_settings SET {action} = $1 WHERE chat_id = $2",
             new_value, chat_id
         )
 
-    # Обновляем интерфейс
+    # Удаляем старое меню и отправляем обновлённое
     await callback.message.delete()
     await show_settings_menu(chat_id)
+
+    # Подтверждаем callback, чтобы Telegram скрыл "часики"
     await callback.answer()
 
 
@@ -1241,14 +1269,18 @@ async def cmd_help(m: Message):
     await m.answer(help_text)
 
 
-pool = None  # Глобальная переменная для пула соединений
+pool = None  # Глобальная переменная для пула подключений к базе данных
 
 
 async def main():
     import uvicorn
     global pool
 
-    # Инициализация пула подключений
+    # Создаём пул подключений к базе данных с параметрами:
+    # DATABASE_URL - строка подключения,
+    # min_size - минимальное количество соединений в пуле,
+    # max_size - максимальное количество,
+    # command_timeout - таймаут выполнения команды (секунд)
     pool = await create_pool(
         DATABASE_URL,
         min_size=5,
@@ -1256,16 +1288,22 @@ async def main():
         command_timeout=60
     )
 
-    # Запуск сервера и бота
+    # Конфигурируем и запускаем uvicorn — ASGI сервер для FastAPI
     config = uvicorn.Config(app=app, host="0.0.0.0", port=5000, log_level="info")
     server = uvicorn.Server(config)
+
+    # Параллельно запускаем:
+    # - сервер FastAPI (uvicorn)
+    # - и поллинг Telegram-бота (dp.start_polling)
     await asyncio.gather(server.serve(), dp.start_polling(bot))
 
 
 if __name__ == "__main__":
     try:
+        # Запускаем главный асинхронный цикл
         asyncio.run(main())
     finally:
-        # Закрытие пула при завершении
+        # При завершении программы аккуратно закрываем пул подключений,
+        # чтобы освободить ресурсы
         if pool:
             asyncio.run(pool.close())

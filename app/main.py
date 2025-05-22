@@ -20,6 +20,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
+import asyncpg
+from asyncpg import create_pool
+
+DATABASE_URL = "postgresql://botuser:123456789@localhost/bitrixbot"
+
 # Конфигурация
 # BITRIX_CLIENT_ID = "local.68187191a08683.25172914"  # client_id Данила
 BITRIX_CLIENT_ID = "local.682b075811e9c7.97053039"  # client_id Ильгиза
@@ -36,16 +41,95 @@ BITRIX_DOMAIN = "b24-eu9n9c.bitrix24.ru"  # Домен портала Битри
 
 is_registered_events: Dict[str, bool] = {}
 
+# Замените секцию "Хранилища данных" на:
+
+async def get_user(chat_id: int) -> Optional[dict]:
+    if not pool:
+        raise RuntimeError("Database pool is not initialized")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE chat_id = $1", chat_id)
+        return dict(row) if row else None
+
+
+async def save_user(user_data: dict):
+    if not pool:
+        raise RuntimeError("Database pool is not initialized")
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (chat_id, access_token, refresh_token, expires, domain, 
+                             member_id, user_id, user_name, is_admin)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                expires = EXCLUDED.expires,
+                domain = EXCLUDED.domain,
+                member_id = EXCLUDED.member_id,
+                user_id = EXCLUDED.user_id,
+                user_name = EXCLUDED.user_name,
+                is_admin = EXCLUDED.is_admin
+        """,
+                           user_data['chat_id'],
+                           user_data['access_token'],
+                           user_data['refresh_token'],
+                           user_data['expires'],
+                           user_data['domain'],
+                           user_data['member_id'],
+                           user_data['user_id'],
+                           user_data['user_name'],
+                           user_data['is_admin'])
+
+
+async def get_notification_settings(chat_id: int) -> dict:
+    if not pool:
+        raise RuntimeError("Database pool is not initialized")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM notification_settings WHERE chat_id = $1",
+            chat_id
+        )
+
+        if row:
+            return dict(row)
+
+        # Создаем запись по умолчанию
+        await conn.execute(
+            "INSERT INTO notification_settings (chat_id) VALUES ($1)",
+            chat_id
+        )
+        return {
+            'new_deals': True,
+            'deal_updates': True,
+            'task_creations': True,
+            'task_updates': True,
+            'comments': True
+        }
+
+
+async def update_notification_setting(chat_id: int, setting: str, value: bool):
+    if not pool:
+        raise RuntimeError("Database pool is not initialized")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE notification_settings SET {setting} = $1 WHERE chat_id = $2",
+            value,
+            chat_id
+        )
+
+
+async def delete_user(chat_id: int):
+    if not pool:
+        raise RuntimeError("Database pool is not initialized")
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE chat_id = $1", chat_id)
+
 # Хранилища данных
-tokens: Dict[str, Dict] = {}  # Хранение данных пользователя для протокола OAuth
 member_map: Dict[str, set[str]] = defaultdict(set)  # ключ — это member_id портала, а значение — set чат‑ID
-notification_settings: Dict[str, Dict] = defaultdict(lambda: {
-    'new_deals': True,
-    'deal_updates': True,
-    'task_creations': True,
-    'task_updates': True,
-    'comments': True
-})
+
 
 # Настройка модуля логирования
 logging.basicConfig(level=logging.INFO)
@@ -61,13 +145,10 @@ class NotificationSettings(StatesGroup):
 # --- Вспомогательные функции ---
 async def refresh_token(chat_id: str) -> bool:
     """Обновление access token, используя refresh token"""
-
-    # Получение данных пользователя
-    user_data = tokens.get(chat_id)
+    user_data = await get_user(int(chat_id))
     if not user_data:
         return False
 
-    # Процесс обновление access token
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -82,16 +163,23 @@ async def refresh_token(chat_id: str) -> bool:
             resp.raise_for_status()
             data = resp.json()
 
-            user_data.update({
+            new_data = {
+                "chat_id": int(chat_id),
                 "access_token": data["access_token"],
                 "refresh_token": data["refresh_token"],
-                "expires": int(time()) + int(data["expires_in"])
-            })
+                "expires": int(time()) + int(data["expires_in"]),
+                "domain": user_data["domain"],
+                "member_id": user_data["member_id"],
+                "user_id": user_data["user_id"],
+                "user_name": user_data["user_name"],
+                "is_admin": user_data["is_admin"]
+            }
+            await save_user(new_data)
             return True
     except httpx.HTTPStatusError as e:
         if "invalid_grant" in str(e):
             await bot.send_message(chat_id, "❌ Сессия истекла, выполните /start")
-            tokens.pop(chat_id, None)
+            await delete_user(int(chat_id))
         return False
 
 
@@ -150,8 +238,8 @@ async def register_webhooks(domain: str, access_token: str):
     3) Ждём, пока всё отвязалось, и вешаем ровно по одному через event.bind
     """
     events = [
-        "OnTaskAdd", "OnTaskUpdate", "OnTaskDelete", "OnTaskCommentAdd",
-        "OnCrmDealAdd", "OnCrmDealUpdate", "OnCrmDealDelete"
+        "OnTaskAdd", "OnTaskUpdate", "OnTaskCommentAdd",
+        "OnCrmDealAdd", "OnCrmDealUpdate"
     ]
 
     async with httpx.AsyncClient() as client:
@@ -231,10 +319,10 @@ async def unified_handler(request: Request):
 async def handle_oauth_callback(request: Request):
     """Авторизация OAuth 2.0"""
     params = dict(request.query_params)
-    logging.info(f"OAuth callback params: {params}")  # Логи
+    logging.info(f"OAuth callback params: {params}")
     domain = params['domain']
 
-    global is_registered_events  # объявляем, что хотим править глобал
+    global is_registered_events
 
     try:
         required = ["code", "state", "domain"]
@@ -256,7 +344,6 @@ async def handle_oauth_callback(request: Request):
             )
             token_data = resp.json()
 
-        # регистрируем вебхуки только если для этого домена ещё не делали
         if not is_registered_events.get(domain, False):
             try:
                 await register_webhooks(domain=domain, access_token=token_data['access_token'])
@@ -266,30 +353,48 @@ async def handle_oauth_callback(request: Request):
 
         member_id = params.get("member_id")
         if member_id:
-            member_map[member_id].add(str(chat_id))
+            member_map[member_id].add(chat_id)
+
         user_info = await get_user_info(params['domain'], token_data['access_token'])
 
-        logging.info(f"User_info: {user_info}")  # Логи
+        # Сохранение в PostgreSQL
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            # Сохраняем пользователя
+            await conn.execute("""
+                INSERT INTO users (
+                    chat_id, access_token, refresh_token, expires,
+                    domain, member_id, user_id, user_name, is_admin
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    expires = EXCLUDED.expires,
+                    domain = EXCLUDED.domain,
+                    member_id = EXCLUDED.member_id,
+                    user_id = EXCLUDED.user_id,
+                    user_name = EXCLUDED.user_name,
+                    is_admin = EXCLUDED.is_admin
+            """,
+                               chat_id,
+                               token_data["access_token"],
+                               token_data["refresh_token"],
+                               int(time()) + int(token_data["expires_in"]),
+                               params["domain"],
+                               params.get("member_id", ""),
+                               int(user_info["id"]),
+                               user_info["name"],
+                               user_info["is_admin"]
+                               )
 
-        # Сохранение данных пользователя
-        tokens[str(chat_id)] = {
-            "access_token": token_data["access_token"],
-            "refresh_token": token_data["refresh_token"],
-            "expires": int(time()) + int(token_data["expires_in"]),
-            "domain": params["domain"],
-            "member_id": params.get("member_id", ""),
-            "user_id": user_info["id"],
-            "user_name": user_info["name"],
-            "is_admin": user_info["is_admin"]
-        }
-
-        notification_settings[str(chat_id)] = {
-            'new_deals': True,
-            'deal_updates': True,
-            'task_creations': True,
-            'task_updates': True,
-            'comments': True
-        }
+            # Создаем настройки по умолчанию
+            await conn.execute("""
+                INSERT INTO notification_settings (chat_id)
+                VALUES ($1)
+                ON CONFLICT (chat_id) DO NOTHING
+            """, chat_id)
+        finally:
+            await conn.close()
 
         await bot.send_message(chat_id, "✅ Авторизация успешна!")
         return HTMLResponse("""
@@ -313,19 +418,15 @@ async def handle_oauth_callback(request: Request):
 async def handle_webhook_event(request: Request):
     """Обработка событий"""
     try:
-        # Получение данных
         form_data = await request.form()
         parsed_data = parse_form_data(dict(form_data))
 
-        logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}")  # Логи
-
-        # logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}") # Логи
+        logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}")
 
         auth_data = parsed_data.get('auth', {})
         event = parsed_data.get('event', '').lower()
         member_id = auth_data.get('member_id')
 
-        # Обработка ошибок при некорректных данных
         if not member_id:
             return JSONResponse({"status": "invalid_member_id"}, status_code=400)
 
@@ -334,36 +435,64 @@ async def handle_webhook_event(request: Request):
             logging.error(f"Member ID {member_id} not mapped to any chat")
             return JSONResponse({"status": "member_not_found"}, status_code=404)
 
-        for chat_id in chat_ids:
-            user_data = tokens.get(chat_id)
-            logging.info(f"Sending to chat {chat_id} with token expires at {user_data['expires']}")
-            if not user_data:
-                logging.error(f"User data not found for chat {chat_id}")
-                return JSONResponse({"status": "unauthorized"}, status_code=401)
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            for chat_id in chat_ids:
+                # Получаем данные пользователя из БД
+                user_data = await conn.fetchrow(
+                    "SELECT * FROM users WHERE chat_id = $1",
+                    int(chat_id)
+                )
 
-            # Обновление токена, если нужно
-            if time() > user_data["expires"] and not await refresh_token(chat_id):
-                return JSONResponse({"status": "token_expired"}, status_code=401)
+                if not user_data:
+                    logging.error(f"User data not found for chat {chat_id}")
+                    continue
 
-            # В цикле обработки chat_ids добавьте:
-            if event == "oncrmdealadd" and not notification_settings[chat_id]['new_deals']:
-                continue
-            elif event == "oncrmdealupdate" and not notification_settings[chat_id]['deal_updates']:
-                continue
-            elif event == "ontaskadd" and not notification_settings[chat_id]['task_creations']:
-                continue
-            elif event == "ontaskupdate" and not notification_settings[chat_id]['task_updates']:
-                continue
-            elif event.startswith("ontaskcomment") and not notification_settings[chat_id]['comments']:
-                continue
+                user_data = dict(user_data)
+                logging.info(f"Sending to chat {chat_id} with token expires at {user_data['expires']}")
 
-            # Срабатывание событий
-            if event.startswith("ontaskcomment"):  # комментарии к задачам
-                await process_comment_event(event, parsed_data, user_data, chat_id)
-            elif event.startswith("ontask"):  # задачи
-                await process_task_event(event, parsed_data, user_data, chat_id)
-            elif event.startswith("oncrmdeal"):  # сделки
-                await process_deal_event(event, parsed_data, user_data, chat_id)
+                # Проверяем срок действия токена
+                if time() > user_data["expires"]:
+                    if not await refresh_token(chat_id):
+                        logging.error(f"Token refresh failed for chat {chat_id}")
+                        continue
+
+                # Получаем настройки уведомлений
+                settings = await conn.fetchrow(
+                    "SELECT * FROM notification_settings WHERE chat_id = $1",
+                    int(chat_id)
+                )
+                settings = dict(settings) if settings else {
+                    'new_deals': True,
+                    'deal_updates': True,
+                    'task_creations': True,
+                    'task_updates': True,
+                    'comments': True
+                }
+
+                # Проверяем настройки уведомлений
+                event_handlers = {
+                    "oncrmdealadd": settings['new_deals'],
+                    "oncrmdealupdate": settings['deal_updates'],
+                    "ontaskadd": settings['task_creations'],
+                    "ontaskupdate": settings['task_updates'],
+                    "ontaskcommentadd": settings['comments']
+                }
+
+                event_type = event.split('_')[0]  # Для обработки составных событий
+                if not event_handlers.get(event_type, True):
+                    continue
+
+                # Обработка событий
+                if event.startswith("ontaskcomment"):
+                    await process_comment_event(event, parsed_data, user_data, chat_id)
+                elif event.startswith("ontask"):
+                    await process_task_event(event, parsed_data, user_data, chat_id)
+                elif event.startswith("oncrmdeal"):
+                    await process_deal_event(event, parsed_data, user_data, chat_id)
+
+        finally:
+            await conn.close()
 
         return JSONResponse({"status": "ok"})
 
@@ -376,7 +505,8 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
     """Получение уведомлений о задачах из Битрикса"""
     try:
         task_id = None
-        logging.info(f"data: {data}")
+        #logging.info(f"data: {data}")
+
         if event != "ontaskdelete":
             task_id = data.get('data', {}).get('FIELDS_AFTER', {}).get('ID')
             if not task_id and event:
@@ -431,12 +561,13 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
         deadline = task.get('deadline')
         user_id = user_data["user_id"]
 
+        deadline_str = deadline
         if deadline:
             try:
                 deadline_date = datetime.strptime(deadline, "%Y-%m-%dT%H:%M:%S%z")  # Добавляем обработку часового пояса
                 deadline_str = deadline_date.strftime("%Y-%m-%d %H:%M")  # Новый формат
             except Exception as e:
-                deadline_str = deadline
+                logging.error(f"Ошибка обработки даты: {deadline}")
 
         if event == "ontaskadd":
             message = (
@@ -478,8 +609,6 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
     except Exception as e:
         logging.error(f"Task processing error: {e}")
 
-
-# Пока в процессе доработки
 async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: str):
     """Получение уведомлений о сделках из Битрикса"""
     try:
@@ -543,7 +672,7 @@ async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: s
                     f"✍️ Изменено: {changed_by_name}"
                 )
 
-            logging.info(f"Deal data: {deal}")
+            # logging.info(f"Deal data: {deal}")  # Логи
 
         if responsible_id:
             if str(user_data.get('user_id')) == str(responsible_id) or user_data.get('is_admin'):
@@ -554,6 +683,10 @@ async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: s
 
 async def process_comment_event(event: str, data: dict, user_data: dict, chat_id: str):
     """Обработка комментариев к задачам из Битрикса"""
+    settings = await get_notification_settings(chat_id)
+    if not settings['comments']:
+        logging.info("Comments notifications are disabled")
+        return
     try:
         comment_data = data.get('data', {}).get('FIELDS_AFTER')
         # logging.info(f"Comment data: {comment_data}") # Логи
@@ -625,7 +758,7 @@ async def cmd_start(m: Message):
 @dp.message(Command("task"))
 async def cmd_task(m: Message):
     """Создание задачи"""
-    user_data = tokens.get(str(m.from_user.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь: /start")
 
@@ -696,11 +829,10 @@ async def cmd_task(m: Message):
         await m.answer(f"⚠️ Системная ошибка: {str(e)}")
 
 
-# В процессе доработки
 @dp.message(Command("deal"))
 async def cmd_deal(m: Message):
     """Создание сделки: /deal Название ЖК | Адрес | Стадия_ID"""
-    user_data = tokens.get(str(m.from_user.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data or not user_data.get("is_admin"):
         return await m.answer("❗ Требуются права администратора. Авторизуйтесь через /start")
 
@@ -745,7 +877,7 @@ async def cmd_deal(m: Message):
 @dp.message(Command("comment"))
 async def cmd_comment(m: Message):
     """Добавить комментарий к задаче: /comment [ID задачи] | Комментарий"""
-    user_data = tokens.get(str(m.from_user.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь через /start")
 
@@ -802,7 +934,7 @@ async def cmd_comment(m: Message):
 @dp.message(Command("stages"))
 async def cmd_stages(m: Message):
     """Получить список стадий сделок"""
-    user_data = tokens.get(str(m.from_user.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь: /start")
 
@@ -827,7 +959,7 @@ async def cmd_stages(m: Message):
 @dp.message(Command("employees"))
 async def cmd_employees(m: Message):
     """Получить список сотрудников Bitrix24"""
-    user_data = tokens.get(str(m.from_user.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь через /start")
 
@@ -875,7 +1007,7 @@ async def cmd_employees(m: Message):
 @dp.message(Command("tasks"))
 async def cmd_tasks(m: Message):
     """Показать список задач пользователя"""
-    user_data = tokens.get(str(m.chat.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь через /start")
 
@@ -939,7 +1071,7 @@ async def cmd_tasks(m: Message):
 @dp.message(Command("deals"))
 async def cmd_deals(m: Message):
     """Показать список сделок"""
-    user_data = tokens.get(str(m.chat.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь через /start")
 
@@ -1004,7 +1136,7 @@ async def cmd_deals(m: Message):
 @dp.message(Command("settings"))
 async def cmd_settings(m: Message):
     """Меню настроек уведомлений"""
-    user_data = tokens.get(str(m.from_user.id))
+    user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь через /start")
 
@@ -1012,7 +1144,9 @@ async def cmd_settings(m: Message):
 
 
 async def show_settings_menu(chat_id: int):
-    settings = notification_settings[str(chat_id)]
+    # Получаем настройки из БД
+    settings = await get_notification_settings(chat_id)
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -1055,16 +1189,36 @@ async def show_settings_menu(chat_id: int):
 
 @dp.callback_query(lambda c: c.data.startswith('toggle_'))
 async def process_toggle(callback: CallbackQuery):
-    chat_id = str(callback.message.chat.id)
+    if not pool:
+        logging.error("Database pool is not initialized")
+        return
+
     action = callback.data.split('_', 1)[1]
+    chat_id = callback.message.chat.id
 
-    # Инвертируем текущее значение
-    notification_settings[chat_id][action] = not notification_settings[chat_id][action]
+    async with pool.acquire() as conn:
+        # Получаем текущее значение
+        current_value = await conn.fetchval(
+            f"SELECT {action} FROM notification_settings WHERE chat_id = $1",
+            chat_id
+        )
 
-    # Обновляем сообщение
+        # Инвертируем значение
+        new_value = not current_value
+
+        # Обновляем в БД
+        await conn.execute(
+            f"UPDATE notification_settings SET {action} = $1 WHERE chat_id = $2",
+            new_value, chat_id
+        )
+
+    # Обновляем интерфейс
     await callback.message.delete()
-    await show_settings_menu(callback.message.chat.id)
+    await show_settings_menu(chat_id)
     await callback.answer()
+
+
+
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
@@ -1087,13 +1241,31 @@ async def cmd_help(m: Message):
     await m.answer(help_text)
 
 
-# --- Main ---
+pool = None  # Глобальная переменная для пула соединений
+
+
 async def main():
     import uvicorn
+    global pool
+
+    # Инициализация пула подключений
+    pool = await create_pool(
+        DATABASE_URL,
+        min_size=5,
+        max_size=20,
+        command_timeout=60
+    )
+
+    # Запуск сервера и бота
     config = uvicorn.Config(app=app, host="0.0.0.0", port=5000, log_level="info")
     server = uvicorn.Server(config)
     await asyncio.gather(server.serve(), dp.start_polling(bot))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Закрытие пула при завершении
+        if pool:
+            asyncio.run(pool.close())

@@ -58,6 +58,24 @@ class TaskHistoryStates(StatesGroup):
     waiting_for_task_id = State()
 
 
+class TaskCreationStates(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_description = State()
+    waiting_for_responsible = State()
+    waiting_for_priority = State()
+    waiting_for_deadline = State()
+
+
+class DealCreationStates(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_address = State()
+    waiting_for_stage_id = State()
+
+
+class CommentCreationStates(StatesGroup):
+    waiting_for_task_id = State()
+    waiting_for_comment_text = State()
+
 
 async def get_user(chat_id: int) -> Optional[dict]:
     """Получает пользователя из базы данных по chat_id."""
@@ -776,167 +794,284 @@ async def cmd_start(m: Message):
 
 
 @dp.message(Command("task"))
-async def cmd_task(m: Message):
-    """Создание задачи"""
+async def cmd_task(m: Message, state: FSMContext):
+    """Начало создания задачи"""
     user_data = await get_user(m.from_user.id)
     if not user_data:
-        return await m.answer("❗ Сначала авторизуйтесь: /start")
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    await m.answer("Введите название задачи:")
+    await state.set_state(TaskCreationStates.waiting_for_title)
+
+
+@dp.message(TaskCreationStates.waiting_for_title)
+async def process_task_title(m: Message, state: FSMContext):
+    if len(m.text) > 255:
+        return await m.answer("❌ Слишком длинное название. Максимум 255 символов. Введите снова:")
+
+    await state.update_data(title=m.text)
+    await m.answer("Введите описание задачи (или 'нет' чтобы пропустить):")
+    await state.set_state(TaskCreationStates.waiting_for_description)
+
+
+@dp.message(TaskCreationStates.waiting_for_description)
+async def process_task_description(m: Message, state: FSMContext):
+    description = m.text if m.text.lower() != "нет" else ""
+    await state.update_data(description=description)
+
+    await m.answer("Введите ID ответственного пользователя (или 'нет' чтобы назначить себя):")
+    await state.set_state(TaskCreationStates.waiting_for_responsible)
+
+
+@dp.message(TaskCreationStates.waiting_for_responsible)
+async def process_task_responsible(m: Message, state: FSMContext):
+    user_data = await get_user(m.from_user.id)
+    data = await state.get_data()
+
+    if m.text.lower() == "нет":
+        responsible_id = user_data["user_id"]
+    else:
+        if not m.text.isdigit():
+            return await m.answer("❌ ID должен быть числом. Введите снова:")
+
+        responsible_id = int(m.text)
+        if not await check_user_exists(user_data["domain"], user_data["access_token"], responsible_id):
+            return await m.answer("❌ Пользователь не найден. Введите снова:")
+
+    await state.update_data(responsible_id=responsible_id)
+    await m.answer("Введите приоритет (1-низкий, 2-средний, 3-высокий или 'нет'):")
+    await state.set_state(TaskCreationStates.waiting_for_priority)
+
+
+@dp.message(TaskCreationStates.waiting_for_priority)
+async def process_task_priority(m: Message, state: FSMContext):
+    priority_map = {"1": 0, "2": 1, "3": 2}
+    priority = None
+
+    if m.text.lower() != "нет":
+        if m.text not in priority_map:
+            return await m.answer("❌ Неверный приоритет. Используйте 1, 2 или 3. Введите снова:")
+        priority = priority_map[m.text]
+
+    await state.update_data(priority=priority)
+    await m.answer("Введите крайний срок в формате ГГГГ-ММ-ДД (или 'нет'):")
+    await state.set_state(TaskCreationStates.waiting_for_deadline)
+
+
+@dp.message(TaskCreationStates.waiting_for_deadline)
+async def process_task_deadline(m: Message, state: FSMContext):
+    user_data = await get_user(m.from_user.id)
+    data = await state.get_data()
+    deadline = None
+
+    if m.text.lower() != "нет":
+        try:
+            deadline = datetime.strptime(m.text, "%Y-%m-%d").strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return await m.answer("❌ Неверный формат даты. Используйте ГГГГ-ММ-ДД. Введите снова:")
+
+    # Сбор всех данных
+    task_data = {
+        "TITLE": data["title"],
+        "DESCRIPTION": data.get("description", ""),
+        "RESPONSIBLE_ID": data["responsible_id"],
+        "PRIORITY": data.get("priority", 1),
+        "DEADLINE": deadline
+    }
 
     try:
-        parts = m.text.split(maxsplit=1)[1].split('|')
-        parts = [p.strip() for p in parts]
-
-        title = parts[0]
-        description = parts[1] if len(parts) > 1 else ""
-        responsible_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else user_data["user_id"]
-        priority = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
-        deadline = parts[4] if len(parts) > 4 else None
-
-        if priority not in (0, 1, 2):
-            raise ValueError("Приоритет должен быть 0, 1 или 2")
-
-        if not await check_user_exists(user_data["domain"], user_data["access_token"], responsible_id):
-            raise ValueError("Пользователь не найден")
-
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"https://{user_data['domain']}/rest/tasks.task.add.json",
                 params={"auth": user_data["access_token"]},
-                json={
-                    "fields": {
-                        "TITLE": title,
-                        "DESCRIPTION": description,
-                        "PRIORITY": priority,
-                        "RESPONSIBLE_ID": responsible_id,
-                        "DEADLINE": deadline
-                    }
-                }
-            )
-
-            # Расширенная обработка ответа
-            try:
-                data = resp.json()
-            except json.JSONDecodeError as e:
-                error_text = resp.text[:200]  # Первые 200 символов ответа
-                logging.error(f"JSON decode error. Response: {error_text}")
-                raise ValueError("Некорректный ответ от сервера Bitrix")
-
-            # Проверка типа данных
-            if not isinstance(data, dict):
-                logging.error(f"Unexpected response type: {type(data)}. Content: {data}")
-                raise ValueError("Ошибка формата ответа")
-
-            # Обработка ошибок API
-            if data.get('error'):
-                error_msg = data.get('error_description', 'Неизвестная ошибка Bitrix')
-                logging.error(f"Bitrix API Error: {error_msg}")
-                raise ValueError(error_msg)
-
-            # Получение ID задачи с проверкой структуры
-            try:
-                task_id = data['result']['task']['id']
-            except KeyError:
-                logging.error(f"Invalid response structure: {data}")
-                raise ValueError("Некорректная структура ответа")
-
-            await m.answer(f"✅ Задача создана! ID: {task_id}")
-
-    except (IndexError, ValueError) as e:
-        await m.answer(
-            f"❌ Ошибка: {str(e)}\nФормат: /task Название | Описание | [ID_исполнителя] | [Приоритет] | [Срок исполнения]")
-    except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
-        await m.answer(f"⚠️ Системная ошибка: {str(e)}")
-
-
-@dp.message(Command("deal"))
-async def cmd_deal(m: Message):
-    """Создание сделки: /deal Название ЖК | Адрес | Стадия_ID"""
-    user_data = await get_user(m.from_user.id)
-    if not user_data or not user_data.get("is_admin"):
-        return await m.answer("❗ Требуются права администратора. Авторизуйтесь через /start")
-
-    try:
-        parts = m.text.split(maxsplit=1)[1].split('|')
-        parts = [p.strip() for p in parts]
-
-        if len(parts) < 3:
-            raise ValueError("Недостаточно параметров. Формат: /deal Название ЖК | Адрес | ID_стадии")
-
-        title, address, stage_id = parts[0], parts[1], parts[2]
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"https://{user_data['domain']}/rest/crm.deal.add.json",
-                params={"auth": user_data["access_token"]},
-                json={
-                    "fields": {
-                        "TITLE": title,
-                        "COMMENTS": address,
-                        "STAGE_ID": stage_id,
-                        "ASSIGNED_BY_ID": user_data["user_id"]
-                    }
-                }
+                json={"fields": task_data}
             )
             data = resp.json()
 
             if data.get('error'):
                 error_msg = data.get('error_description', 'Неизвестная ошибка Bitrix')
-                raise ValueError(f"Bitrix API: {error_msg}")
+                raise ValueError(error_msg)
 
-            deal_id = data.get('result')
+            task_id = data['result']['task']['id']
+            await m.answer(f"✅ Задача создана! ID: {task_id}")
+
+    except Exception as e:
+        await m.answer(f"❌ Ошибка при создании задачи: {str(e)}")
+
+    await state.clear()
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+
+    await state.clear()
+    await m.answer("❌ Создание задачи отменено")
+
+
+# 2. Обновленный обработчик команды /deal
+@dp.message(Command("deal"))
+async def cmd_deal(m: Message, state: FSMContext):
+    """Начало создания сделки"""
+    user_data = await get_user(m.from_user.id)
+    if not user_data or not user_data.get("is_admin"):
+        return await m.answer("❗ Требуются права администратора. Авторизуйтесь через /start")
+
+    await m.answer("Введите название сделки (обязательно):")
+    await state.set_state(DealCreationStates.waiting_for_title)
+
+
+# 3. Обновленные обработчики шагов
+@dp.message(DealCreationStates.waiting_for_title)
+async def process_deal_title(m: Message, state: FSMContext):
+    if len(m.text.strip()) == 0:
+        return await m.answer("❌ Название не может быть пустым. Введите снова:")
+
+    if len(m.text) > 255:
+        return await m.answer("❌ Слишком длинное название. Максимум 255 символов. Введите снова:")
+
+    await state.update_data(title=m.text)
+    await m.answer("Введите адрес (обязательно):")
+    await state.set_state(DealCreationStates.waiting_for_address)
+
+
+@dp.message(DealCreationStates.waiting_for_address)
+async def process_deal_address(m: Message, state: FSMContext):
+    if len(m.text.strip()) == 0:
+        return await m.answer("❌ Адрес не может быть пустым. Введите снова:")
+
+    await state.update_data(address=m.text)
+    await m.answer("Введите ID стадии сделки (или 'нет' чтобы пропустить):")
+    await state.set_state(DealCreationStates.waiting_for_stage_id)
+
+
+@dp.message(DealCreationStates.waiting_for_stage_id)
+async def process_deal_stage(m: Message, state: FSMContext):
+    user_data = await get_user(m.from_user.id)
+    data = await state.get_data()
+    stage_id = None
+
+    if m.text.lower() != "нет":
+        # Проверка существования стадии
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"https://{user_data['domain']}/rest/crm.dealcategory.stage.list",
+                    params={"auth": user_data["access_token"]}
+                )
+                stages = resp.json().get('result', [])
+                stage_ids = {stage['STATUS_ID'] for stage in stages}
+
+                if m.text not in stage_ids:
+                    return await m.answer("❌ Неверный ID стадии. Введите корректный ID или 'нет':")
+
+                stage_id = m.text
+        except Exception as e:
+            return await m.answer(f"❌ Ошибка проверки стадии: {str(e)}")
+
+    # Сбор всех данных
+    deal_data = {
+        "TITLE": data["title"],
+        "COMMENTS": data["address"],
+        "ASSIGNED_BY_ID": user_data["user_id"]
+    }
+
+    if stage_id:
+        deal_data["STAGE_ID"] = stage_id
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{user_data['domain']}/rest/crm.deal.add.json",
+                params={"auth": user_data["access_token"]},
+                json={"fields": deal_data}
+            )
+            deal_data = resp.json()
+
+            if deal_data.get('error'):
+                error_msg = deal_data.get('error_description', 'Неизвестная ошибка Bitrix')
+                raise ValueError(error_msg)
+
+            deal_id = deal_data.get('result')
             await m.answer(f"✅ Сделка создана! ID: {deal_id}")
 
-    except (IndexError, ValueError) as e:
-        await m.answer(f"❌ Ошибка: {str(e)}\nФормат: /deal Название ЖК | Адрес | ID_стадии")
     except Exception as e:
-        logging.error(f"Ошибка создания сделки: {str(e)}", exc_info=True)
-        await m.answer(f"⚠️ Ошибка: {str(e)}")
+        await m.answer(f"❌ Ошибка при создании сделки: {str(e)}")
+
+    await state.clear()
 
 
+# 2. Обновим обработчик команды /comment
 @dp.message(Command("comment"))
-async def cmd_comment(m: Message):
-    """Добавить комментарий к задаче: /comment [ID задачи] | Комментарий"""
+async def cmd_comment(m: Message, state: FSMContext):
+    """Начало добавления комментария"""
     user_data = await get_user(m.from_user.id)
     if not user_data:
         return await m.answer("❗ Сначала авторизуйтесь через /start")
 
+    await m.answer("Введите ID задачи:")
+    await state.set_state(CommentCreationStates.waiting_for_task_id)
+
+
+@dp.message(CommentCreationStates.waiting_for_task_id)
+async def process_comment_task_id(m: Message, state: FSMContext):
+    user_data = await get_user(m.from_user.id)
+
+    # Проверка ID задачи
+    if not m.text.isdigit():
+        return await m.answer("❌ ID задачи должен быть числом. Введите снова:")
+
+    task_id = int(m.text)
+
+    # Проверка существования задачи
     try:
-        # Парсим аргументы
-        parts = m.text.split(maxsplit=1)[1].split('|', 1)
-        if len(parts) < 2:
-            raise ValueError("Неверный формат команды")
-
-        task_id = parts[0].strip()
-        comment_text = parts[1].strip()
-
-        # Проверяем доступ к задаче
         async with httpx.AsyncClient() as client:
-            # Проверка существования задачи
-            task_resp = await client.get(
+            resp = await client.get(
                 f"https://{user_data['domain']}/rest/tasks.task.get.json",
                 params={
                     "taskId": task_id,
                     "auth": user_data["access_token"]
                 }
             )
-            task_data = task_resp.json()
-            if 'error' in task_data:
-                raise ValueError("Задача не найдена или нет доступа")
+            task_data = resp.json()
 
-            # Отправка комментария
-            comment_resp = await client.post(
+            if 'error' in task_data:
+                return await m.answer("❌ Задача не найдена или нет доступа. Введите другой ID:")
+
+            await state.update_data(task_id=task_id)
+            await m.answer("Введите текст комментария:")
+            await state.set_state(CommentCreationStates.waiting_for_comment_text)
+
+    except Exception as e:
+        await m.answer(f"❌ Ошибка проверки задачи: {str(e)}")
+        await state.clear()
+
+
+@dp.message(CommentCreationStates.waiting_for_comment_text)
+async def process_comment_text(m: Message, state: FSMContext):
+    user_data = await get_user(m.from_user.id)
+    data = await state.get_data()
+    task_id = data['task_id']
+
+    if len(m.text.strip()) == 0:
+        return await m.answer("❌ Комментарий не может быть пустым. Введите снова:")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
                 f"https://{user_data['domain']}/rest/task.commentitem.add.json",
                 params={"auth": user_data["access_token"]},
                 json={
                     "TASK_ID": task_id,
                     "fields": {
                         "AUTHOR_ID": user_data["user_id"],
-                        "POST_MESSAGE": comment_text
+                        "POST_MESSAGE": m.text
                     }
                 }
             )
-            comment_data = comment_resp.json()
+            comment_data = resp.json()
 
             if 'error' in comment_data:
                 error_msg = comment_data.get('error_description', 'Ошибка добавления комментария')
@@ -944,11 +1079,10 @@ async def cmd_comment(m: Message):
 
             await m.answer(f"💬 Комментарий добавлен к задаче {task_id}")
 
-    except (IndexError, ValueError) as e:
-        await m.answer(f"❌ Ошибка: {str(e)}\nФормат: /comment [ID задачи] | [Текст комментария]")
     except Exception as e:
-        logging.error(f"Comment error: {str(e)}", exc_info=True)
-        await m.answer(f"⚠️ Ошибка: {str(e)}")
+        await m.answer(f"❌ Ошибка: {str(e)}")
+
+    await state.clear()
 
 
 @dp.message(Command("stages"))
@@ -1366,9 +1500,10 @@ async def cmd_help(m: Message):
 📚 Доступные команды:
 /start - Авторизация в Bitrix24
 /tasks - Вывести список задач
-/task - Создать задачу (Формат: Название | Описание | [ID_исполнителя] | [Приоритет] | [Срок исполнения])
-/comment - Добавить комментарий к задаче (Формат: [ID_задачи] | Комментарий)
-/deal - Создать сделку (Формат: Название ЖК | Адрес | [ID_стадии]) ❗Только для админов❗
+/task - Создать новую задачу (название и кому назначена задача обязательны)
+/cancel - Отменить текущее действие
+/comment - Добавить комментарий к задаче 
+/deal - Создать новую сделку (название и адрес обязательны) ❗Только для админов
 /deals - Показать список сделок
 /employees - Получить список сотрудников
 /stages - Получить список доступных стадий для сделок

@@ -17,7 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import asyncpg
 from asyncpg import create_pool
-
+from aiogram.fsm.context import FSMContext
 
 DATABASE_URL = "postgresql://botuser:123456789@localhost/bitrixbot"
 
@@ -35,6 +35,28 @@ TELEGRAM_TOKEN = "8179379861:AAEoKsITnDaREJINuHJu4qXONwxTIlSncxc"
 BITRIX_DOMAIN = "b24-eu9n9c.bitrix24.ru"  # Домен портала Битрикс24 Ильгиза
 
 is_registered_events: Dict[str, bool] = {}
+
+member_map: Dict[str, set[str]] = defaultdict(set)  # ключ — это member_id портала, а значение — set чат‑ID
+
+# Базовая конфигурация логирования для всего приложения
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация компонентов FastAPI и Telegram-бота на Aiogram
+app = FastAPI()
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+
+class NotificationSettings(StatesGroup):
+    """Состояния для настройки уведомлений."""
+
+    waiting_action = State()  # Ожидание выбора действия от пользователя
+
+
+class TaskHistoryStates(StatesGroup):
+    """Состояния для вывода истории изменений задачи."""
+    waiting_for_task_id = State()
+
 
 
 async def get_user(chat_id: int) -> Optional[dict]:
@@ -136,24 +158,6 @@ async def delete_user(chat_id: int):
 
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE chat_id = $1", chat_id)
-
-
-# Хранилища данных
-member_map: Dict[str, set[str]] = defaultdict(set)  # ключ — это member_id портала, а значение — set чат‑ID
-
-# Базовая конфигурация логирования для всего приложения
-logging.basicConfig(level=logging.INFO)
-
-# Инициализация компонентов FastAPI и Telegram-бота на Aiogram
-app = FastAPI()
-bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-
-class NotificationSettings(StatesGroup):
-    """Состояния для настройки уведомлений."""
-
-    waiting_action = State()  # Ожидание выбора действия от пользователя
 
 
 # --- Вспомогательные функции ---
@@ -333,7 +337,7 @@ async def unified_handler(request: Request):
 async def handle_oauth_callback(request: Request):
     """Авторизация OAuth 2.0"""
     params = dict(request.query_params)
-    logging.info(f"OAuth callback params: {params}")
+    # logging.info(f"OAuth callback params: {params}")  # Логи
     domain = params['domain']
 
     global is_registered_events
@@ -435,7 +439,7 @@ async def handle_webhook_event(request: Request):
         form_data = await request.form()
         parsed_data = parse_form_data(dict(form_data))
 
-        logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}")
+        # logging.info(f"Parsed webhook data: {json.dumps(parsed_data, indent=2)}")  # Логи
 
         auth_data = parsed_data.get('auth', {})
         event = parsed_data.get('event', '').lower()
@@ -519,7 +523,7 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
     """Получение уведомлений о задачах из Битрикса"""
     try:
         task_id = None
-        #logging.info(f"data: {data}")
+        # logging.info(f"data: {data}")  # Логи
 
         if event != "ontaskdelete":
             task_id = data.get('data', {}).get('FIELDS_AFTER', {}).get('ID')
@@ -544,7 +548,7 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
 
                 task = task_data.get('result', {}).get('task', {})
 
-                logging.info(f"Task data: {task}")  # Логи
+                # logging.info(f"Task data: {task}")  # Логи
 
         message = ""
         responsible_id = None
@@ -623,6 +627,7 @@ async def process_task_event(event: str, data: dict, user_data: dict, chat_id: s
     except Exception as e:
         logging.error(f"Task processing error: {e}")
 
+
 async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: str):
     """Получение уведомлений о сделках из Битрикса"""
     try:
@@ -695,6 +700,7 @@ async def process_deal_event(event: str, data: dict, user_data: dict, chat_id: s
     except Exception as e:
         logging.error(f"Ошибка обработки сделки: {e}")
 
+
 async def process_comment_event(event: str, data: dict, user_data: dict, chat_id: str):
     """Обработка комментариев к задачам из Битрикса"""
     settings = await get_notification_settings(chat_id)
@@ -721,7 +727,7 @@ async def process_comment_event(event: str, data: dict, user_data: dict, chat_id
                 }
             )
             comment = resp.json().get('result', {})
-            logging.info(f"Comment data: {comment}")  # Логи
+            # logging.info(f"Comment data: {comment}")  # Логи
 
             author_name = comment.get('AUTHOR_NAME')
             comment_text = comment.get('POST_MESSAGE', '')[:1000]  # Обрезаем длинные сообщения
@@ -1246,6 +1252,111 @@ async def process_toggle(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.message(Command("task_history"))
+async def cmd_task_history(m: Message, state: FSMContext):
+    """Запросить у пользователя ID задачи для истории изменений"""
+    user_data = await get_user(m.from_user.id)
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+    await m.answer("Введите, пожалуйста, ID задачи, историю которой хотите увидеть:")
+    await state.set_state(TaskHistoryStates.waiting_for_task_id)
+
+
+@dp.message(TaskHistoryStates.waiting_for_task_id)
+async def process_task_history_id(m: Message, state: FSMContext):
+    """Обработка введённого ID задачи и вывод истории изменений"""
+    await state.clear()  # сброс состояния, независимо от результата
+    user_data = await get_user(m.from_user.id)
+    if not user_data:
+        return await m.answer("❗ Сначала авторизуйтесь через /start")
+
+    # Проверяем, что введено число
+    if not m.text.isdigit():
+        return await m.answer("❌ Неверный формат ID.")
+
+    task_id = m.text
+    domain = user_data["domain"]
+    token = user_data["access_token"]
+    user_id = user_data["user_id"]
+
+    # Запрашиваем историю
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://{domain}/rest/tasks.task.history.list.json",
+            params={"auth": token},
+            json={"taskId": int(task_id)}
+        )
+        data = resp.json()
+
+    if data.get("error"):
+        return await m.answer(f"❌ Ошибка Bitrix24: {data.get('error_description')}")
+
+    try:
+        history = data.get("result", []).get('list')
+    except AttributeError:
+        return await m.answer("❌ Ошибка: Данная задача недоступна или удалена.")
+
+    # logging.info(f"History data: {history}")  # Логи
+
+    if not history:
+        return await m.answer(f"ℹ️ Для задачи №{task_id} история изменений не найдена.")
+
+    status_map = {
+        '2': "🆕 Ждет выполнения",
+        '3': "🔄 Выполняется",
+        '4': "⏳ Ожидает контроля",
+        '5': "✅ Завершена",
+        '6': "⏸ Отложена"
+    }
+
+    priority_map = {
+        '0': "Низкий",
+        '1': "Средний",
+        '2': "Высокий"
+    }
+
+    # Форматируем вывод
+    messages = [
+        f"🗂 История задачи <b><a href='https://{BITRIX_DOMAIN}/company/personal/user/{user_id}/tasks/task/view/{task_id}/'>№{task_id}</a></b>:"]
+    for entry in history:
+        date = entry.get("createdDate", "–")
+        try:
+            date_date = datetime.strptime(date, "%Y-%m-%dT%H:%M:%S%z")
+            date = date_date.strftime("%Y-%m-%d %H:%M")
+        except Exception as e:
+            logging.error(f"Ошибка обработки даты: {date}")
+        field = entry.get("field", "–")
+        old = entry.get("value").get("from", "")
+        new = entry.get("value").get("to", "")
+        author = f"{entry.get("user").get("name")} {entry.get("user").get("lastName")}"
+
+        text = "-"
+        match field:
+            case "NEW":
+                text = "Создана задача\n"
+            case "TITLE":
+                text = (f"Изменено Название\n"
+                        f"Изменение: {old} → {new}\n")
+            case "DESCRIPTION":
+                text = "Изменено Описание\n"
+            case "STATUS":
+                text = (f"Изменен Статус\n"
+                        f"Изменение: {status_map[old]} → {status_map[new]}\n")
+            case "PRIORITY":
+                text = (f"Изменен Приоритет\n"
+                        f"Изменение: {priority_map[old]} → {priority_map[new]}\n")
+            case "DEADLINE":
+                text = "Изменен Крайний срок\n"
+            case "COMMENT":
+                text = f"Добавлен комментарий №{new}\n"
+
+        text += f"Автор: {author}"
+        messages.append(f"\n<b>{date}</b> - {text}")
+
+    # В Телеграм нельзя отправить очень длинное сообщение, разбиваем по 10 записей
+    chunk_size = 10
+    for i in range(0, len(messages), chunk_size):
+        await m.answer("\n".join(messages[i:i + chunk_size]), parse_mode="HTML")
 
 
 @dp.message(Command("help"))
@@ -1261,6 +1372,7 @@ async def cmd_help(m: Message):
 /deals - Показать список сделок
 /employees - Получить список сотрудников
 /stages - Получить список доступных стадий для сделок
+/task_history - Получить историю изменений задачи
 /settings - Настройка уведомлений
 
 /help - Справка о командах
